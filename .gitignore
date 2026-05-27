@@ -1,0 +1,21 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# User data (generated at runtime — never commit)
+*.enc
+*.db
+*.log
+*.pid
+config.json
+.fernet_key
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
