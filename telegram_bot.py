@@ -351,8 +351,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines = [f"*History for `{receipt}`:*\n"]
         for r in rows:
             lines.append(
-                f"• `{r['recorded_at'][:16]}` UTC\n"
-                f"  Status: {r['status']}\n"
+                f"• Status: {r['status']}\n"
                 f"  USCIS updated: {r.get('updated_at') or '—'}"
             )
         await _reply(update, "\n\n".join(lines))
@@ -371,8 +370,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines = [f"*`{receipt}` history ({len(rows)} entries):*\n"]
         for r in rows[-10:]:
             lines.append(
-                f"• `{r['recorded_at'][:16]}` UTC\n"
-                f"  Status: {r['status']}\n"
+                f"• Status: {r['status']}\n"
                 f"  USCIS updated: {r.get('updated_at') or '—'}"
             )
         if len(rows) > 10:
