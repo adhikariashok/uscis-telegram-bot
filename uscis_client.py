@@ -155,10 +155,12 @@ def _events_hash(case_data: dict) -> str:
 
 # ── Main fetch function ───────────────────────────────────────────────────────
 
-def fetch_case(receipt_number: str, account: str = "primary") -> dict | None:
+def fetch_case(receipt_number: str, account: str = "primary",
+               _retry_after_refresh: bool = True) -> dict | None:
     """
     Returns normalised case dict (with 'events_hash' key) or None on failure.
-    Returns {"_session_expired": True} if the auth session needs refresh.
+    Returns {"_session_expired": True} if the auth session needs a full re-login.
+    On a 401, attempts one silent refresh before giving up.
     """
     receipt = receipt_number.upper()
 
@@ -180,9 +182,15 @@ def fetch_case(receipt_number: str, account: str = "primary") -> dict | None:
                     return result
                 if resp.status_code in (401, 403):
                     logger.warning(
-                        "Auth session rejected at %s (HTTP %d) — session may be expired",
+                        "Auth session rejected at %s (HTTP %d) — attempting silent refresh",
                         url, resp.status_code,
                     )
+                    if _retry_after_refresh:
+                        from auth_manager import silent_refresh_session
+                        ok = silent_refresh_session(account)
+                        if ok:
+                            logger.info("Silent refresh succeeded — retrying fetch for %s", receipt)
+                            return fetch_case(receipt, account, _retry_after_refresh=False)
                     return {"_session_expired": True, "receipt_number": receipt, "account": account}
             except Exception as exc:
                 logger.warning("Auth endpoint %s error: %s", url, exc)
