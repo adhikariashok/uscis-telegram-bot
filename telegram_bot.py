@@ -10,9 +10,13 @@ Commands:
   /help               — show help
 """
 import asyncio
+import csv
+import io
+import json
 import logging
 import threading
 import re
+from datetime import datetime as _dt
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -337,6 +341,27 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _reply(update, msg)
 
 
+def _format_history_entry(r: dict) -> str:
+    entry = (
+        f"• Status: {r['status']}\n"
+        f"  USCIS updated: {r.get('updated_at') or '—'}"
+    )
+    try:
+        events = json.loads(r.get("events_snapshot") or "[]")
+    except Exception:
+        events = []
+    if events:
+        entry += "\n\n  Events:"
+        for ev in events:
+            ts = (ev.get("eventTimestamp") or ev.get("createdAtTimestamp")
+                  or ev.get("appointmentDateTime") or ev.get("timestamp")
+                  or ev.get("date") or "")[:10]
+            label = _event_label(ev)
+            if label:
+                entry += f"\n  ‣ {ts} — {label}"
+    return entry
+
+
 async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _register_user(update)
     uid = update.effective_user.id
@@ -350,10 +375,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         lines = [f"*History for `{receipt}`:*\n"]
         for r in rows:
-            lines.append(
-                f"• Status: {r['status']}\n"
-                f"  USCIS updated: {r.get('updated_at') or '—'}"
-            )
+            lines.append(_format_history_entry(r))
         await _reply(update, "\n\n".join(lines))
         return
 
@@ -369,21 +391,13 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             continue
         lines = [f"*`{receipt}` history ({len(rows)} entries):*\n"]
         for r in rows[-10:]:
-            lines.append(
-                f"• Status: {r['status']}\n"
-                f"  USCIS updated: {r.get('updated_at') or '—'}"
-            )
+            lines.append(_format_history_entry(r))
         if len(rows) > 10:
             lines.append(f"_(showing last 10 of {len(rows)} entries — use `/history {receipt}` for full list)_")
         await _reply(update, "\n\n".join(lines))
 
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    import csv
-    import io
-    import json as _json
-    from datetime import datetime as _dt
-
     _register_user(update)
     uid = update.effective_user.id
     rows = get_all_history_for_user(uid)
@@ -392,19 +406,22 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _reply(update, "No history recorded yet. The bot logs every status change — check back after the next poll.")
         return
 
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow([
+    stamp = _dt.utcnow().strftime("%Y%m%d_%H%M%S")
+    total_cases = len(set(r["receipt_number"] for r in rows))
+
+    # ── CSV 1: summary (one row per status change) ────────────────────────────
+    summary_buf = io.StringIO()
+    summary_writer = csv.writer(summary_buf)
+    summary_writer.writerow([
         "receipt_number", "account", "status",
         "uscis_updated_at", "bot_recorded_at_utc", "events_count"
     ])
     for r in rows:
         try:
-            events = _json.loads(r.get("events_snapshot") or "[]")
-            events_count = len(events)
+            events_count = len(json.loads(r.get("events_snapshot") or "[]"))
         except Exception:
             events_count = 0
-        writer.writerow([
+        summary_writer.writerow([
             r["receipt_number"],
             r.get("account", "primary"),
             r["status"],
@@ -413,15 +430,53 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             events_count,
         ])
 
-    filename = f"uscis_report_{_dt.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
-    buf.seek(0)
-    doc = io.BytesIO(buf.read().encode("utf-8"))
-    doc.name = filename
+    summary_filename = f"uscis_summary_{stamp}.csv"
+    summary_buf.seek(0)
+    summary_doc = io.BytesIO(summary_buf.read().encode("utf-8"))
+    summary_doc.name = summary_filename
+
+    # ── CSV 2: events detail (one row per event) ──────────────────────────────
+    events_buf = io.StringIO()
+    events_writer = csv.writer(events_buf)
+    events_writer.writerow([
+        "receipt_number", "account", "case_status", "uscis_updated_at",
+        "event_timestamp", "event_code", "event_description"
+    ])
+    for r in rows:
+        try:
+            events = json.loads(r.get("events_snapshot") or "[]")
+        except Exception:
+            events = []
+        for ev in events:
+            ts = (ev.get("eventTimestamp") or ev.get("createdAtTimestamp")
+                  or ev.get("appointmentDateTime") or ev.get("timestamp")
+                  or ev.get("date") or "")[:19]
+            code = str(ev.get("eventCode") or ev.get("actionType") or "").strip()
+            label = _event_label(ev)
+            events_writer.writerow([
+                r["receipt_number"],
+                r.get("account", "primary"),
+                r["status"],
+                r.get("updated_at", ""),
+                ts,
+                code,
+                label,
+            ])
+
+    events_filename = f"uscis_events_{stamp}.csv"
+    events_buf.seek(0)
+    events_doc = io.BytesIO(events_buf.read().encode("utf-8"))
+    events_doc.name = events_filename
 
     await update.effective_chat.send_document(
-        document=doc,
-        filename=filename,
-        caption=f"USCIS case history report — {len(rows)} status entries across {len(set(r['receipt_number'] for r in rows))} case(s).",
+        document=summary_doc,
+        filename=summary_filename,
+        caption=f"Summary — {len(rows)} status entries across {total_cases} case(s).",
+    )
+    await update.effective_chat.send_document(
+        document=events_doc,
+        filename=events_filename,
+        caption=f"Events detail — one row per event across all status snapshots.",
     )
 
 
