@@ -1,8 +1,10 @@
 # USCIS Case Monitor
 
-A Windows background app that watches your USCIS case status and sends you a **Telegram notification the moment anything changes** — new events, updated timestamps, or a status change.
+A USCIS case monitor that watches your case status and sends you a
+**Telegram notification the moment anything changes** - new events,
+updated timestamps, or a status change.
 
-![Platform](https://img.shields.io/badge/platform-Windows-blue)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue)
 ![Python](https://img.shields.io/badge/python-3.13-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -11,17 +13,20 @@ A Windows background app that watches your USCIS case status and sends you a **T
 ## How it works
 
 ```
-Your PC (runs 24/7)          myUSCIS API              Telegram
+Your machine (or VPS)        myUSCIS API              Telegram
 ─────────────────────        ─────────────            ─────────────────
-Windows tray app     ──────► Polls every 5 min ──────► Sends you a
-(no console window)          Authenticated             message if
+Tray or headless app ──────► Polls every 5 min ──────► Sends you a
+                             Authenticated             message if
                              session via Chrome        anything changed
 ```
 
-- Logs into **my.uscis.gov** once using your real Chrome browser — no credentials stored
+- Logs into **my.uscis.gov** once using your real Chrome browser
+  - no credentials stored
 - Saves the encrypted session and silently refreshes it every 10 minutes
-- Polls the authenticated USCIS API every 5 minutes for each registered case
-- Notifies you via Telegram bot when status, updated timestamp, or event timeline changes
+- Polls the authenticated USCIS API every 5 minutes for each
+  registered case
+- Notifies you via Telegram bot when status, updated timestamp,
+  or event timeline changes
 - Supports **multiple USCIS accounts** (e.g. yourself + spouse)
 
 ---
@@ -32,7 +37,8 @@ Windows tray app     ──────► Polls every 5 min ──────�
 - ✅ Silent background session refresh — never expires mid-monitoring
 - ✅ Multi-account support — monitor your case and your spouse's case separately
 - ✅ Telegram bot interface — register cases and check status from your phone
-- ✅ Windows system tray — lives quietly in your taskbar
+- ✅ Windows system tray mode - lives quietly in your taskbar
+- ✅ macOS/Linux headless mode - run in terminal or as a service
 - ✅ Fully local — all data stays on your PC, nothing sent to third parties
 
 ---
@@ -41,8 +47,9 @@ Windows tray app     ──────► Polls every 5 min ──────�
 
 | Requirement | Notes |
 |---|---|
-| Windows 10 / 11 | Required (tray app, Chrome CDP) |
-| Python 3.13 | [python.org](https://www.python.org/downloads/) — check "Add to PATH" |
+| Windows 10 / 11 | Optional tray mode |
+| macOS / Linux | Headless mode |
+| Python 3.13 | [python.org](https://www.python.org/downloads/) |
 | Google Chrome | Any recent version |
 | Telegram account | Free |
 
@@ -57,7 +64,41 @@ Windows tray app     ──────► Polls every 5 min ──────�
 4. Follow the setup wizard
 ```
 
-See **[SETUP.md](SETUP.md)** for the full step-by-step guide with screenshots and troubleshooting.
+See **[SETUP.md](SETUP.md)** for the full setup guide with
+screenshots and troubleshooting.
+
+## Run Modes
+
+- `tray` - Windows system tray app (default on Windows)
+- `headless` - terminal/server mode (default on macOS/Linux)
+
+Examples:
+
+```bash
+# macOS/Linux (headless)
+python main.py --mode headless
+
+# Windows tray
+python main.py --mode tray
+```
+
+Configuration now lives in root `.env`. Start from the template:
+
+```bash
+cp .env.example .env
+```
+
+Then set at least:
+
+```bash
+TELEGRAM_BOT_TOKEN=your_bot_token_here
+```
+
+If you are on Windows and prefer the GUI, you can still run setup:
+
+```bash
+python setup_wizard.py
+```
 
 ---
 
@@ -80,7 +121,7 @@ See **[SETUP.md](SETUP.md)** for the full step-by-step guide with screenshots an
 
 ## Multiple Accounts (e.g. spouse)
 
-1. Right-click the tray icon → **Add Account**
+1. Right-click the tray icon -> **Add Account**
 2. Type a label (e.g. `wife`)
 3. Log in with your spouse's myUSCIS credentials
 4. Register their cases: `/register IOE0000000000 wife`
@@ -106,14 +147,17 @@ Each account has its own encrypted session file and refreshes independently.
 └── run.bat            Launch the app
 ```
 
-Data is stored in `%USERPROFILE%\.uscis_monitor\` — never inside the repo folder.
+Data is stored in `%USERPROFILE%\.uscis_monitor\` and never
+inside the repo folder.
 
 ---
 
 ## Privacy & Security
 
-- **No credentials are stored.** The app captures browser session cookies (same as your browser does) and encrypts them on disk with a key that never leaves your machine.
-- **No third-party servers.** The app talks only to `my.uscis.gov` and `api.telegram.org`.
+- **No credentials are stored.** The app captures browser session
+  cookies and encrypts them on disk with a local key.
+- **No third-party servers.** The app talks only to
+  `my.uscis.gov` and `api.telegram.org`.
 - This tool is for personal use to monitor your own USCIS cases.
 
 ---

@@ -10,8 +10,11 @@ Commands:
   /help               — show help
 """
 import asyncio
+import html
 import logging
 import threading
+import re
+import urllib.request
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -19,26 +22,141 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from database import upsert_user, add_case, remove_case, get_user_cases
 from uscis_client import fetch_case
-from auth_manager import list_accounts
+from auth_manager import capture_session, list_accounts
 
 logger = logging.getLogger(__name__)
 
 _app: Application | None = None
 _loop: asyncio.AbstractEventLoop | None = None
+_RECEIPT_RE = re.compile(r"^[A-Z]{3}\d{10}$")
+_CODE_RE = re.compile(r"^[A-Z0-9]{2,6}$")
+_NIEM_DEF_URL = (
+    "https://niem.github.io/model/5.0/scr/"
+    "BenefitDocumentStatusCategoryCodeSimpleType/"
+)
+_NIEM_MAP: dict[str, str] = {}
+_NIEM_MAP_READY = False
+_NIEM_MAP_LOCK = threading.Lock()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def _reply(update: Update, text: str, markdown=True):
-    await update.message.reply_text(
-        text,
-        parse_mode=ParseMode.MARKDOWN if markdown else None,
-    )
+    msg = None
+    chat = None
+    mode = None
+
+    msg = update.message
+    mode = ParseMode.MARKDOWN if markdown else None
+    if msg is not None:
+        await msg.reply_text(
+            text,
+            parse_mode=mode,
+        )
+        return
+
+    chat = update.effective_chat
+    if chat is not None:
+        await chat.send_message(
+            text=text,
+            parse_mode=mode,
+        )
+        return
+
+    logger.warning("Cannot reply: update has no message/chat.")
 
 
 def _register_user(update: Update):
+    user = None
+
     user = update.effective_user
+    if user is None:
+        logger.warning("Cannot register user: update has no effective_user.")
+        return
     upsert_user(user.id, user.username or user.first_name or "")
+
+
+def _normalize_code(value: str) -> str:
+    cleaned = ""
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", str(value or ""))
+    return cleaned.upper().strip()
+
+
+def _load_niem_map():
+    global _NIEM_MAP_READY
+
+    content = ""
+    plain = ""
+    line = ""
+    code = ""
+    label = ""
+    match = None
+
+    if _NIEM_MAP_READY:
+        return
+
+    with _NIEM_MAP_LOCK:
+        if _NIEM_MAP_READY:
+            return
+        try:
+            with urllib.request.urlopen(_NIEM_DEF_URL, timeout=10) as resp:
+                content = resp.read().decode("utf-8", errors="ignore")
+        except Exception as exc:
+            logger.warning("Could not load NIEM status definitions: %s", exc)
+            _NIEM_MAP_READY = True
+            return
+
+        plain = re.sub(r"<[^>]+>", "\n", content)
+        plain = html.unescape(plain)
+        for line in plain.splitlines():
+            line = " ".join(line.strip().split())
+            if not line:
+                continue
+            match = re.match(
+                r"^([A-Z0-9]{2,6})\s+([A-Z][A-Z0-9 ,./()'&;:-]{4,})$",
+                line,
+            )
+            if not match:
+                continue
+            code = match.group(1).strip().upper()
+            label = match.group(2).strip()
+            if not _CODE_RE.match(code):
+                continue
+            if len(label) > 180:
+                continue
+            _NIEM_MAP[code] = label
+        _NIEM_MAP_READY = True
+
+
+def _event_label(event: dict) -> str:
+    raw = ""
+    code = ""
+    mapped = ""
+
+    _load_niem_map()
+
+    for raw in [
+        event.get("eventCode"),
+        event.get("statusCategoryCode"),
+        event.get("actionType"),
+        event.get("code"),
+    ]:
+        code = _normalize_code(raw)
+        if not code:
+            continue
+        mapped = _NIEM_MAP.get(code, "")
+        if mapped:
+            return f"{code} - {mapped}"
+
+    for raw in [
+        event.get("description"),
+        event.get("title"),
+        event.get("actionType"),
+        event.get("eventCode"),
+    ]:
+        if raw:
+            return str(raw).strip()
+    return ""
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
@@ -58,7 +176,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/status IOE123` — check one specific case\n"
         "`/list` — show all cases you're tracking\n"
         "`/accounts` — show saved USCIS accounts\n"
-        "`/addaccount wife` — instructions to add a new account\n"
+        "`/addaccount wife` — login and save a new account session\n"
         "`/help` — show this message",
     )
 
@@ -68,16 +186,31 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_register(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    accounts = []
+    account = ""
     _register_user(update)
     if not ctx.args:
         await _reply(update, "Usage: `/register IOE1234567890 [account]`\nExample: `/register IOE123 wife`")
         return
 
-    receipt = ctx.args[0].upper().strip()
+    receipt_raw = ""
+    receipt = ""
+
+    receipt_raw = ctx.args[0]
+    receipt = re.sub(r"[^A-Za-z0-9]", "", receipt_raw).upper().strip()
     account = ctx.args[1].lower().strip() if len(ctx.args) > 1 else "primary"
 
-    if len(receipt) < 7 or not receipt[:3].isalpha():
-        await _reply(update, "❌ That doesn't look like a valid receipt number (e.g. `IOE1234567890`).")
+    if len(ctx.args) <= 1 and account == "primary":
+        accounts = list_accounts()
+        if "primary" not in accounts and len(accounts) == 1:
+            account = accounts[0]
+
+    if not _RECEIPT_RE.match(receipt):
+        await _reply(
+            update,
+            "❌ That doesn't look like a valid receipt number.\n"
+            "Use format like `IOE1234567890`.",
+        )
         return
 
     from auth_manager import has_session
@@ -85,7 +218,9 @@ async def cmd_register(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _reply(
             update,
             f"⚠️ No saved session for account *{account}*.\n"
-            f"Right-click the tray icon → *Add Account* → type `{account}` to log in first.",
+            f"Run `/addaccount {account}` first, then retry register.\n"
+            f"You can also specify account explicitly:\n"
+            f"`/register {receipt} <account>`",
         )
         return
 
@@ -105,21 +240,49 @@ async def cmd_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["*Saved USCIS accounts:*\n"]
     for a in accounts:
         lines.append(f"• {a}")
-    lines.append("\nTo add a new account, right-click the tray icon → *Add Account*.")
+    lines.append(
+        "\nTo add a new account, run `/addaccount <name>` "
+        "(example: `/addaccount wife`)."
+    )
     await _reply(update, "\n".join(lines))
 
 
 async def cmd_addaccount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    loop = None
+    ok = False
+    name = ""
+
     _register_user(update)
     name = ctx.args[0].lower().strip() if ctx.args else "new"
+    if not name.replace("_", "").replace("-", "").isalnum():
+        await _reply(
+            update,
+            "Use letters, numbers, `_`, or `-` in account names.\n"
+            "Example: `/addaccount wife`",
+        )
+        return
+
     await _reply(
         update,
-        f"To add the *{name}* account:\n\n"
-        f"1. Right-click the *USCIS Monitor* tray icon (bottom-right taskbar)\n"
-        f"2. Click *Add Account*\n"
-        f"3. Type `{name}` when prompted\n"
-        f"4. Log in to myUSCIS in the Chrome window that opens\n\n"
-        f"Then register cases with:\n`/register IOE123456 {name}`",
+        f"Opening Chrome login for account *{name}*.\n\n"
+        "Please complete USCIS login in the browser window. "
+        "I will confirm here when done.",
+    )
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(None, capture_session, name, None)
+
+    if ok:
+        await _reply(
+            update,
+            f"✅ Account *{name}* saved.\n"
+            f"Now register cases with:\n`/register IOE1234567890 {name}`",
+        )
+        return
+
+    await _reply(
+        update,
+        f"❌ Could not save account *{name}*.\n"
+        "Try `/addaccount <name>` again and complete login in Chrome.",
     )
 
 
@@ -200,8 +363,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ts = (ev.get("eventTimestamp") or ev.get("createdAtTimestamp")
                       or ev.get("appointmentDateTime") or ev.get("timestamp")
                       or ev.get("date") or "")[:10]
-                label = (ev.get("eventCode") or ev.get("actionType")
-                         or ev.get("description") or ev.get("title") or "")
+                label = _event_label(ev)
                 if label:
                     events_text += f"\n• {ts} — {label}"
 
