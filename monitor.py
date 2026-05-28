@@ -3,11 +3,12 @@ Background polling scheduler.
 Checks all registered cases every POLL_INTERVAL_SECONDS and fires
 send_notification(telegram_id, message) for any case that changed.
 """
+import json
 import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from config import load_config
-from database import get_all_cases, update_case_status
+from database import get_all_cases, update_case_status, log_case_history
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,13 @@ def _check_all():
 
         # Always update the DB (even if unchanged, to refresh last_checked)
         update_case_status(receipt, new_status, new_updated, new_hash)
+
+        if changed:
+            log_case_history(
+                receipt, tid, account,
+                new_status, new_updated, new_hash,
+                json.dumps(result.get("events", [])),
+            )
 
         if changed and _notify_fn:
             events_text = ""

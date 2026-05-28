@@ -30,6 +30,19 @@ def init_db():
                 FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
             )
         """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS case_history (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                receipt_number   TEXT NOT NULL,
+                telegram_id      INTEGER NOT NULL,
+                account          TEXT NOT NULL DEFAULT 'primary',
+                status           TEXT,
+                updated_at       TEXT,
+                events_hash      TEXT,
+                events_snapshot  TEXT,
+                recorded_at      TEXT DEFAULT (datetime('now'))
+            )
+        """)
         # Migrate existing tables that lack the account column
         try:
             con.execute("ALTER TABLE cases ADD COLUMN account TEXT NOT NULL DEFAULT 'primary'")
@@ -94,3 +107,45 @@ def update_case_status(receipt_number: str, status: str, updated_at: str, events
             (status, updated_at, events_hash, datetime.utcnow().isoformat(), receipt_number),
         )
         con.commit()
+
+
+def log_case_history(receipt_number: str, telegram_id: int, account: str,
+                     status: str, updated_at: str, events_hash: str, events_snapshot: str):
+    with _conn() as con:
+        con.execute(
+            """INSERT INTO case_history
+               (receipt_number, telegram_id, account, status, updated_at, events_hash, events_snapshot)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (receipt_number.upper(), telegram_id, account, status, updated_at, events_hash, events_snapshot),
+        )
+        con.commit()
+
+
+def get_case_history(receipt_number: str, telegram_id: int = None) -> list:
+    with _conn() as con:
+        con.row_factory = sqlite3.Row
+        if telegram_id is not None:
+            cur = con.execute(
+                """SELECT * FROM case_history
+                   WHERE receipt_number = ? AND telegram_id = ?
+                   ORDER BY recorded_at ASC""",
+                (receipt_number.upper(), telegram_id),
+            )
+        else:
+            cur = con.execute(
+                "SELECT * FROM case_history WHERE receipt_number = ? ORDER BY recorded_at ASC",
+                (receipt_number.upper(),),
+            )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_all_history_for_user(telegram_id: int) -> list:
+    with _conn() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.execute(
+            """SELECT * FROM case_history
+               WHERE telegram_id = ?
+               ORDER BY receipt_number, recorded_at ASC""",
+            (telegram_id,),
+        )
+        return [dict(r) for r in cur.fetchall()]

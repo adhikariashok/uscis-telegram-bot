@@ -18,7 +18,7 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler, filters
 )
 from telegram.constants import ParseMode
-from database import upsert_user, add_case, remove_case, get_user_cases
+from database import upsert_user, add_case, remove_case, get_user_cases, get_case_history, get_all_history_for_user
 from uscis_client import fetch_case
 from auth_manager import capture_session, list_accounts
 
@@ -126,6 +126,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/status wife` — check all cases under a specific account\n"
         "`/status IOE123` — check one specific case\n"
         "`/list` — show all cases you're tracking\n"
+        "`/history` — show full status change history\n"
+        "`/history IOE123` — show history for one case\n"
+        "`/report` — download a CSV report of all history\n"
         "`/accounts` — show saved USCIS accounts\n"
         "`/addaccount wife` — login and save a new account session\n"
         "`/help` — show this message",
@@ -334,6 +337,94 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await _reply(update, msg)
 
 
+async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    _register_user(update)
+    uid = update.effective_user.id
+    all_cases = get_user_cases(uid)
+
+    if ctx.args:
+        receipt = re.sub(r"[^A-Za-z0-9]", "", ctx.args[0]).upper()
+        rows = get_case_history(receipt, uid)
+        if not rows:
+            await _reply(update, f"No history recorded yet for `{receipt}`.")
+            return
+        lines = [f"*History for `{receipt}`:*\n"]
+        for r in rows:
+            lines.append(
+                f"• `{r['recorded_at'][:16]}` UTC\n"
+                f"  Status: {r['status']}\n"
+                f"  USCIS updated: {r['updated_at'] or '—'}"
+            )
+        await _reply(update, "\n\n".join(lines))
+        return
+
+    if not all_cases:
+        await _reply(update, "No cases being monitored. Use `/register <number>` first.")
+        return
+
+    for case in all_cases:
+        receipt = case["receipt_number"]
+        rows = get_case_history(receipt, uid)
+        if not rows:
+            await _reply(update, f"`{receipt}` — no history recorded yet.")
+            continue
+        lines = [f"*`{receipt}` history ({len(rows)} entries):*\n"]
+        for r in rows[-10:]:
+            lines.append(
+                f"• `{r['recorded_at'][:16]}` UTC — {r['status']}"
+            )
+        if len(rows) > 10:
+            lines.append(f"_(showing last 10 of {len(rows)} entries — use `/history {receipt}` for full list)_")
+        await _reply(update, "\n".join(lines))
+
+
+async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    import csv
+    import io
+    import json as _json
+    from datetime import datetime as _dt
+
+    _register_user(update)
+    uid = update.effective_user.id
+    rows = get_all_history_for_user(uid)
+
+    if not rows:
+        await _reply(update, "No history recorded yet. The bot logs every status change — check back after the next poll.")
+        return
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "receipt_number", "account", "status",
+        "uscis_updated_at", "bot_recorded_at_utc", "events_count"
+    ])
+    for r in rows:
+        try:
+            events = _json.loads(r.get("events_snapshot") or "[]")
+            events_count = len(events)
+        except Exception:
+            events_count = 0
+        writer.writerow([
+            r["receipt_number"],
+            r.get("account", "primary"),
+            r["status"],
+            r.get("updated_at", ""),
+            r.get("recorded_at", ""),
+            events_count,
+        ])
+
+    filename = f"uscis_report_{_dt.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    buf.seek(0)
+    doc = io.BytesIO(buf.read().encode("utf-8"))
+    doc.name = filename
+
+    await update.effective_chat.send_document(
+        document=doc,
+        filename=filename,
+        caption=f"USCIS case history report — {len(rows)} status entries across {len(set(r['receipt_number'] for r in rows))} case(s).",
+    )
+
+
 async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _reply(update, "Unknown command. Try /help.", markdown=False)
 
@@ -358,6 +449,8 @@ async def _bot_main(token: str):
     _app.add_handler(CommandHandler("status", cmd_status))
     _app.add_handler(CommandHandler("accounts", cmd_accounts))
     _app.add_handler(CommandHandler("addaccount", cmd_addaccount))
+    _app.add_handler(CommandHandler("history", cmd_history))
+    _app.add_handler(CommandHandler("report", cmd_report))
     _app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
 
     async with _app:
