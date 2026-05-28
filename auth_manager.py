@@ -568,8 +568,28 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
             for c in raw
         ]
         save_session(cookies, extra_headers, account,
-                     new_local_storage or local_storage)
+                     new_local_storage or data.get("local_storage") or {})
         logger.info("Silent refresh succeeded for '%s'.", account)
+
+        # Warn if the Okta session cookie will expire soon (3-hour hard limit).
+        # The sid cookie carries the absolute session expiry set at login time;
+        # no amount of token renewal can push it past that boundary.
+        try:
+            import datetime as _dt
+            for c in raw:
+                if c.get("name") in ("sid", "JSESSIONID", "usi_session"):
+                    exp = c.get("expires", 0)
+                    if exp and exp > 0:
+                        remaining = exp - time.time()
+                        if remaining < 3600:  # less than 1 hour left
+                            mins = int(remaining / 60)
+                            _alert(
+                                f"⚠️ USCIS session for *{account}* expires in ~{mins} min.\n"
+                                "Please re-login via the tray icon to avoid interruption."
+                            )
+        except Exception:
+            pass
+
         success = True
 
     except Exception as exc:
