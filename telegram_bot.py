@@ -67,10 +67,25 @@ def _register_user(update: Update):
 
 
 def _event_label(event: dict) -> str:
-    for key in ["description", "title", "actionType", "eventCode"]:
+    from uscis_codes import EVENT_CODES
+
+    # Prefer full human-readable text the API already provides
+    for key in ["description", "title", "actionType"]:
         val = event.get(key)
         if val:
-            return str(val).strip()
+            text = str(val).strip()
+            # If it looks like a bare code (all caps, ≤6 chars), try to enrich it
+            if len(text) <= 6 and text.isupper():
+                label = EVENT_CODES.get(text)
+                return f"{text} — {label}" if label else text
+            return text
+
+    # Fall back to eventCode, enriched from bundled dictionary
+    code = str(event.get("eventCode") or "").strip().upper()
+    if code:
+        label = EVENT_CODES.get(code)
+        return f"{code} — {label}" if label else code
+
     return ""
 
 
