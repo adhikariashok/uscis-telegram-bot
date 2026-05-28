@@ -98,14 +98,60 @@ def list_accounts() -> list[str]:
 # ── Chrome / CDP helpers ──────────────────────────────────────────────────────
 
 def _find_chrome() -> str | None:
+    candidates = []
+    p = None
+    system = ""
+    program_files = ""
+    program_files_x86 = ""
+    local_app_data = ""
+    name = ""
+    path_val = ""
+    cmd = []
+    result = None
+
+    system = os.uname().sysname if hasattr(os, "uname") else ""
+
+    program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    program_files_x86 = os.environ.get(
+        "PROGRAMFILES(X86)",
+        r"C:\Program Files (x86)",
+    )
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+
     candidates = [
-        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Google/Chrome/Application/chrome.exe",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(program_files) / "Google/Chrome/Application/chrome.exe",
+        Path(program_files_x86) / "Google/Chrome/Application/chrome.exe",
+        Path(local_app_data) / "Google/Chrome/Application/chrome.exe",
+        Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        Path("/usr/bin/google-chrome"),
+        Path("/usr/bin/google-chrome-stable"),
+        Path("/usr/bin/chromium-browser"),
+        Path("/usr/bin/chromium"),
     ]
+
     for p in candidates:
         if p.exists():
             return str(p)
+
+    if system == "Darwin":
+        for name in ["google chrome", "Google Chrome"]:
+            cmd = ["mdfind", f'kMDItemDisplayName == "{name}"']
+            try:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                path_val = result.stdout.strip().splitlines()[0]
+                if path_val:
+                    p = Path(path_val) / "Contents/MacOS/Google Chrome"
+                    if p.exists():
+                        return str(p)
+            except Exception:
+                continue
+
     try:
         import winreg
         with winreg.OpenKey(
