@@ -350,9 +350,12 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         lines = [f"*History for `{receipt}`:*\n"]
         for r in rows:
-            ts = (r.get("updated_at") or "")[:16].replace("T", " ")
-            lines.append(f"• `{ts}` — {r['status']}")
-        await _reply(update, "\n".join(lines))
+            lines.append(
+                f"• `{r['recorded_at'][:16]}` UTC\n"
+                f"  Status: {r['status']}\n"
+                f"  USCIS updated: {r.get('updated_at') or '—'}"
+            )
+        await _reply(update, "\n\n".join(lines))
         return
 
     if not all_cases:
@@ -367,11 +370,14 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             continue
         lines = [f"*`{receipt}` history ({len(rows)} entries):*\n"]
         for r in rows[-10:]:
-            ts = (r.get("updated_at") or "")[:16].replace("T", " ")
-            lines.append(f"• `{ts}` — {r['status']}")
+            lines.append(
+                f"• `{r['recorded_at'][:16]}` UTC\n"
+                f"  Status: {r['status']}\n"
+                f"  USCIS updated: {r.get('updated_at') or '—'}"
+            )
         if len(rows) > 10:
             lines.append(f"_(showing last 10 of {len(rows)} entries — use `/history {receipt}` for full list)_")
-        await _reply(update, "\n".join(lines))
+        await _reply(update, "\n\n".join(lines))
 
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
