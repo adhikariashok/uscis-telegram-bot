@@ -153,18 +153,18 @@ def start(notify_fn):
         max_instances=1,
         coalesce=True,
     )
-    # Refresh OAuth tokens every hour using the persistent Chrome profile.
-    # USCIS Okta has a ~3-hour hard session max age; refreshing every hour
-    # ensures we check the remaining lifetime and warn before it expires.
+    # Refresh OAuth tokens every 45 minutes. Okta access tokens expire in ~1 hour;
+    # refreshing at 45-minute intervals ensures we renew while the token is still
+    # valid (15-minute buffer) rather than racing against expiry.
     _scheduler.add_job(
         _refresh_all_sessions,
-        trigger=IntervalTrigger(hours=1),
+        trigger=IntervalTrigger(minutes=45),
         id="session_refresh",
         max_instances=1,
         coalesce=True,
     )
     _scheduler.start()
-    logger.info("Monitor started — polling every %d seconds, refreshing sessions every hour.", interval)
+    logger.info("Monitor started — polling every %d seconds, refreshing sessions every 45 minutes.", interval)
 
 
 def stop():

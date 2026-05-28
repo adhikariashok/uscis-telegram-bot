@@ -44,6 +44,30 @@ def _chrome_profile_dir(account: str) -> Path:
     return p
 
 
+def _clear_chrome_locks(profile_dir: Path) -> None:
+    """
+    Remove Chrome lock files that a previously crashed or force-killed Chrome
+    process may have left behind. Without this, the next headless Chrome launch
+    sees the profile as 'in use', exits immediately, and the CDP endpoint never
+    becomes reachable (manifests as 'Headless Chrome did not start').
+    """
+    lock_names = [
+        "Default/LOCK",
+        "Default/lockfile",
+        "SingletonLock",
+        "SingletonCookie",
+        "SingletonSocket",
+    ]
+    for name in lock_names:
+        p = profile_dir / name
+        try:
+            if p.exists():
+                p.unlink()
+                logger.info("Cleared stale Chrome lock: %s", p)
+        except Exception as exc:
+            logger.debug("Could not remove Chrome lock %s: %s", p, exc)
+
+
 # ── Session persistence ───────────────────────────────────────────────────────
 
 def save_session(cookies: list, extra_headers: dict, account: str = "primary",
@@ -170,7 +194,7 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _wait_for_cdp(port: int, timeout: float = 20.0) -> bool:
+def _wait_for_cdp(port: int, timeout: float = 30.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -214,7 +238,14 @@ def _launch_chrome(port: int, profile_dir: str, url: str, headless: bool = False
         "--disable-extensions",
     ]
     if headless:
-        args += ["--headless=new", "--window-size=1920,1080"]
+        args += [
+            "--headless=new",
+            "--window-size=1920,1080",
+            "--disable-gpu",                    # required on Windows for headless CDP
+            "--disable-dev-shm-usage",          # prevents /dev/shm exhaustion
+            "--disable-session-crashed-bubble", # prevents 'restore pages?' prompt that blocks startup
+            "--disable-infobars",
+        ]
     else:
         args.append("--start-maximized")
     args.append(url)
@@ -455,10 +486,19 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
     port = _free_port()
     # Reuse the persistent profile from login — preserves Okta cookies, localStorage,
     # and IndexedDB so the Okta SDK can silently renew the refresh token itself.
-    profile_dir = str(_chrome_profile_dir(account))
+    profile_path = _chrome_profile_dir(account)
+    profile_dir = str(profile_path)
+
+    # Clear any stale lock files left by a previously crashed Chrome process.
+    # A locked profile causes headless Chrome to exit immediately without ever
+    # exposing the CDP endpoint (shows as "Headless Chrome did not start").
+    _clear_chrome_locks(profile_path)
 
     try:
-        proc = _launch_chrome(port, profile_dir, USCIS_DASHBOARD_URL, headless=True)
+        # Start headless Chrome on about:blank so we can inject cookies before
+        # navigating — avoids the race where Chrome opens the dashboard before
+        # the CDP session is ready to set cookies.
+        proc = _launch_chrome(port, profile_dir, "about:blank", headless=True)
     except Exception as exc:
         _alert(f"Could not launch headless Chrome: {exc}")
         return False
@@ -480,9 +520,37 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
         cmd = 1
 
         _cdp_send(ws, "Network.enable", {}, cmd); cmd += 1
+        _cdp_send(ws, "Page.enable", {}, cmd); cmd += 1
 
-        # Wait for Okta SDK to silently renew tokens via the profile's stored state
-        time.sleep(10)
+        # Inject the most recently saved cookies BEFORE navigating.
+        # The Chrome profile dir may have stale/expired cookies from the previous
+        # refresh attempt; injecting the saved session gives the browser (and the
+        # Okta SDK) the freshest starting state so it can silently renew the token.
+        saved_cookies = data.get("cookies", [])
+        if saved_cookies:
+            cdp_cookies = [
+                {
+                    "name": c["name"], "value": c["value"],
+                    "domain": c.get("domain", ""),
+                    "path": c.get("path", "/"),
+                    "secure": c.get("secure", False),
+                }
+                for c in saved_cookies
+                if c.get("domain") and c.get("value")
+            ]
+            if cdp_cookies:
+                try:
+                    _cdp_send(ws, "Network.setCookies", {"cookies": cdp_cookies}, cmd); cmd += 1
+                    logger.info("Silent refresh [%s]: pre-injected %d cookies before navigation",
+                                account, len(cdp_cookies))
+                except Exception as exc:
+                    logger.warning("Silent refresh [%s]: cookie pre-inject failed: %s", account, exc)
+
+        # Navigate to the dashboard now that the cookie jar is primed
+        _cdp_send(ws, "Page.navigate", {"url": USCIS_DASHBOARD_URL}, cmd); cmd += 1
+
+        # Give Okta SDK time to complete its silent token renewal
+        time.sleep(25)
 
         # Check we landed on an authenticated page (not redirected to login)
         result = _cdp_send(ws, "Runtime.evaluate",
