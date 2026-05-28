@@ -567,30 +567,45 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
             }
             for c in raw
         ]
+
+        # Verify new cookies in memory BEFORE saving — the Chrome profile can
+        # serve a cached page that looks authenticated while the actual session
+        # is dead. If we save first and verify second, we destroy good working
+        # cookies before we know the new ones are bad.
+        import requests as _req
+        test_sess = _req.Session()
+        for c in cookies:
+            test_sess.cookies.set(
+                c["name"], c["value"],
+                domain=c.get("domain", ""), path=c.get("path", "/"),
+            )
+        if extra_headers:
+            test_sess.headers.update(extra_headers)
+        test_sess.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+        })
+        try:
+            r = test_sess.get("https://my.uscis.gov/api/cases", timeout=10)
+            if r.status_code in (401, 403):
+                logger.warning(
+                    "Silent refresh [%s]: new cookies are dead (HTTP %d) — keeping existing session.",
+                    account, r.status_code,
+                )
+                _alert(
+                    f"⚠️ Session for *{account}* has fully expired — silent refresh failed.\n"
+                    "Please re-login via the tray icon."
+                )
+                return False
+        except Exception as exc:
+            logger.warning("Silent refresh [%s]: pre-save verify error: %s — saving anyway.", account, exc)
+
         save_session(cookies, extra_headers, account,
                      new_local_storage or data.get("local_storage") or {})
-
-        # Verify the saved session actually works — headless Chrome can load a
-        # cached dashboard page whose URL looks authenticated while the server-side
-        # session is already dead, producing a false-positive refresh.
-        import requests as _req
-        test_sess = build_requests_session(account)
-        if test_sess:
-            try:
-                r = test_sess.get("https://my.uscis.gov/api/cases", timeout=10)
-                if r.status_code in (401, 403):
-                    logger.warning(
-                        "Silent refresh [%s]: captured cookies are dead (HTTP %d) — re-login required.",
-                        account, r.status_code,
-                    )
-                    _alert(
-                        f"⚠️ Session for *{account}* has fully expired — silent refresh captured dead cookies.\n"
-                        "Please re-login via the tray icon."
-                    )
-                    return False
-            except Exception as exc:
-                logger.warning("Silent refresh [%s]: post-save verify failed: %s", account, exc)
-
         logger.info("Silent refresh succeeded for '%s'.", account)
 
         # Warn if the Okta session cookie will expire soon (3-hour hard limit).
