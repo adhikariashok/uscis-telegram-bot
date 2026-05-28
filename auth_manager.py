@@ -569,19 +569,40 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
         ]
         save_session(cookies, extra_headers, account,
                      new_local_storage or data.get("local_storage") or {})
+
+        # Verify the saved session actually works — headless Chrome can load a
+        # cached dashboard page whose URL looks authenticated while the server-side
+        # session is already dead, producing a false-positive refresh.
+        import requests as _req
+        test_sess = build_requests_session(account)
+        if test_sess:
+            try:
+                r = test_sess.get("https://my.uscis.gov/api/cases", timeout=10)
+                if r.status_code in (401, 403):
+                    logger.warning(
+                        "Silent refresh [%s]: captured cookies are dead (HTTP %d) — re-login required.",
+                        account, r.status_code,
+                    )
+                    _alert(
+                        f"⚠️ Session for *{account}* has fully expired — silent refresh captured dead cookies.\n"
+                        "Please re-login via the tray icon."
+                    )
+                    return False
+            except Exception as exc:
+                logger.warning("Silent refresh [%s]: post-save verify failed: %s", account, exc)
+
         logger.info("Silent refresh succeeded for '%s'.", account)
 
         # Warn if the Okta session cookie will expire soon (3-hour hard limit).
         # The sid cookie carries the absolute session expiry set at login time;
         # no amount of token renewal can push it past that boundary.
         try:
-            import datetime as _dt
             for c in raw:
                 if c.get("name") in ("sid", "JSESSIONID", "usi_session"):
                     exp = c.get("expires", 0)
                     if exp and exp > 0:
                         remaining = exp - time.time()
-                        if remaining < 3600:  # less than 1 hour left
+                        if remaining < 3600:
                             mins = int(remaining / 60)
                             _alert(
                                 f"⚠️ USCIS session for *{account}* expires in ~{mins} min.\n"
