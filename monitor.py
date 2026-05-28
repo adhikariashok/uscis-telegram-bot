@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 _scheduler: BackgroundScheduler | None = None
 _notify_fn = None   # set by start()
+_seen_this_session: set[str] = set()  # receipt numbers polled at least once since startup
 
 
 def _check_all():
@@ -58,11 +59,13 @@ def _check_all():
         old_hash = case.get("last_events_hash")
 
         changed = (old_status != new_status) or (old_hash and old_hash != new_hash)
+        first_poll = receipt not in _seen_this_session
+        _seen_this_session.add(receipt)
 
         # Always update the DB (even if unchanged, to refresh last_checked)
         update_case_status(receipt, new_status, new_updated, new_hash)
 
-        if changed:
+        if changed or first_poll:
             log_case_history(
                 receipt, tid, account,
                 new_status, new_updated, new_hash,
