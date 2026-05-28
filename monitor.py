@@ -132,17 +132,17 @@ def start(notify_fn):
         max_instances=1,
         coalesce=True,
     )
-    # Refresh OAuth tokens every 3 hours — with Okta refresh tokens stored in
-    # localStorage, headless Chrome can silently renew sessions for days.
+    # Refresh OAuth tokens every 2 hours using the persistent Chrome profile,
+    # which preserves Okta's full state (cookies, localStorage, IndexedDB).
     _scheduler.add_job(
         _refresh_all_sessions,
-        trigger=IntervalTrigger(hours=3),
+        trigger=IntervalTrigger(hours=2),
         id="session_refresh",
         max_instances=1,
         coalesce=True,
     )
     _scheduler.start()
-    logger.info("Monitor started — polling every %d seconds, refreshing sessions every 3 hours.", interval)
+    logger.info("Monitor started — polling every %d seconds, refreshing sessions every 2 hours.", interval)
 
 
 def stop():

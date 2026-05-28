@@ -7,10 +7,8 @@ Each account gets its own encrypted session file.
 import json
 import logging
 import os
-import shutil
 import socket
 import subprocess
-import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -37,6 +35,13 @@ def _cipher() -> Fernet:
 
 def _session_path(account: str) -> Path:
     return APP_DIR / f"session_{account}.enc"
+
+
+def _chrome_profile_dir(account: str) -> Path:
+    """Persistent Chrome profile dir per account — preserves Okta's full session state."""
+    p = APP_DIR / f"chrome_profile_{account}"
+    p.mkdir(exist_ok=True)
+    return p
 
 
 # ── Session persistence ───────────────────────────────────────────────────────
@@ -318,20 +323,18 @@ def capture_session(account: str = "primary", status_callback=None) -> bool:
         return False
 
     port = _free_port()
-    tmp = tempfile.mkdtemp(prefix="uscis_login_")
+    profile_dir = str(_chrome_profile_dir(account))
 
     _cb(f"Launching Chrome for '{account}' account...")
     try:
-        proc = _launch_chrome(port, tmp, USCIS_LOGIN_URL, headless=False)
+        proc = _launch_chrome(port, profile_dir, USCIS_LOGIN_URL, headless=False)
     except Exception as exc:
         _cb(f"Failed to launch Chrome: {exc}")
-        shutil.rmtree(tmp, ignore_errors=True)
         return False
 
     if not _wait_for_cdp(port):
         _cb("Chrome did not start in time.")
         proc.terminate()
-        shutil.rmtree(tmp, ignore_errors=True)
         return False
 
     _cb("Waiting for you to log in — the browser will close automatically.")
@@ -351,7 +354,6 @@ def capture_session(account: str = "primary", status_callback=None) -> bool:
     if not logged_in:
         _cb("Login timed out (5 minutes). Please try again from the tray icon.")
         proc.terminate()
-        shutil.rmtree(tmp, ignore_errors=True)
         return False
 
     # Wait a moment for any final token-refresh XHR calls to complete
@@ -372,7 +374,7 @@ def capture_session(account: str = "primary", status_callback=None) -> bool:
         except Exception:
             pass
         time.sleep(1)
-        shutil.rmtree(tmp, ignore_errors=True)
+        # Persistent profile dir is intentionally kept — reused by silent_refresh_session
 
     if not cookies:
         _cb("No cookies captured — please try again.")
@@ -405,19 +407,19 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
         return False
 
     port = _free_port()
-    tmp = tempfile.mkdtemp(prefix="uscis_refresh_")
+    # Reuse the persistent profile from login — preserves Okta cookies, localStorage,
+    # and IndexedDB so the Okta SDK can silently renew the refresh token itself.
+    profile_dir = str(_chrome_profile_dir(account))
 
     try:
-        proc = _launch_chrome(port, tmp, "https://my.uscis.gov", headless=True)
+        proc = _launch_chrome(port, profile_dir, USCIS_DASHBOARD_URL, headless=True)
     except Exception as exc:
         _alert(f"Could not launch headless Chrome: {exc}")
-        shutil.rmtree(tmp, ignore_errors=True)
         return False
 
     if not _wait_for_cdp(port):
         _alert("Headless Chrome did not start.")
         proc.terminate()
-        shutil.rmtree(tmp, ignore_errors=True)
         return False
 
     success = False
@@ -431,42 +433,10 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
         ws = websocket.create_connection(tab["webSocketDebuggerUrl"], timeout=20)
         cmd = 1
 
-        # Inject existing cookies before navigating
         _cdp_send(ws, "Network.enable", {}, cmd); cmd += 1
-        for c in data.get("cookies", []):
-            try:
-                _cdp_send(ws, "Network.setCookie", {
-                    "name": c["name"], "value": c["value"],
-                    "domain": c.get("domain") or ".my.uscis.gov",
-                    "path": c.get("path", "/"),
-                    "secure": c.get("secure", False),
-                }, cmd)
-                cmd += 1
-            except Exception:
-                pass
 
-        # Inject saved localStorage (Okta refresh tokens) before the page loads
-        # so the Okta SDK can silently renew the access token without a new login.
-        # This is what extends sessions from ~4 hours to days.
-        local_storage = data.get("local_storage", {})
-        if local_storage:
-            ls_entries = json.dumps(local_storage)
-            setup_js = (
-                "(function() {"
-                f"  var entries = {ls_entries};"
-                "  for (var k in entries) {"
-                "    try { localStorage.setItem(k, entries[k]); } catch(e) {}"
-                "  }"
-                "})()"
-            )
-            _cdp_send(ws, "Page.enable", {}, cmd); cmd += 1
-            _cdp_send(ws, "Page.addScriptToEvaluateOnNewDocument",
-                      {"source": setup_js}, cmd); cmd += 1
-            logger.info("Silent refresh [%s]: injecting %d localStorage keys", account, len(local_storage))
-
-        # Navigate to dashboard so the Okta SDK silently refreshes OAuth tokens
-        _cdp_send(ws, "Page.navigate", {"url": USCIS_DASHBOARD_URL}, cmd); cmd += 1
-        time.sleep(8)  # extra time for Okta token-refresh XHR
+        # Wait for Okta SDK to silently renew tokens via the profile's stored state
+        time.sleep(10)
 
         # Check we landed on an authenticated page (not redirected to login)
         result = _cdp_send(ws, "Runtime.evaluate",
@@ -568,7 +538,7 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
         except Exception:
             pass
         time.sleep(1)
-        shutil.rmtree(tmp, ignore_errors=True)
+        # Persistent profile dir is intentionally kept
 
     return success
 
