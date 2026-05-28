@@ -21,6 +21,9 @@ _DEFAULTS = {
     "session_path": str(_DEFAULT_APP_DIR / "session.enc"),
     "key_path": str(_DEFAULT_APP_DIR / ".fernet_key"),
     "log_path": str(_DEFAULT_APP_DIR / "monitor.log"),
+    # Comma-separated Telegram user IDs allowed to run /addaccount.
+    # Leave empty to allow all users (not recommended on a public bot).
+    "allowed_telegram_ids": "",
 }
 
 
@@ -106,6 +109,24 @@ def _write_env_file(values: dict):
     ENV_PATH.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _migrate_from_json():
+    """One-time migration: copy config.json values into .env on first startup."""
+    old_path = _DEFAULT_APP_DIR / "config.json"
+    if ENV_PATH.exists() or not old_path.exists():
+        return
+    try:
+        import json as _json
+        with open(old_path) as f:
+            old_data = _json.load(f)
+        merged = dict(_DEFAULTS)
+        for k, v in old_data.items():
+            if k in merged:
+                merged[k] = v
+        _write_env_file(merged)
+    except Exception:
+        pass
+
+
 def save_config(data: dict):
     current = load_config()
     current.update(data)
@@ -119,6 +140,8 @@ def _path_from_cfg(key: str, fallback: Path) -> Path:
         return fallback
     return Path(value).expanduser()
 
+
+_migrate_from_json()
 
 APP_DIR = _path_from_cfg("app_dir", _DEFAULT_APP_DIR)
 APP_DIR.mkdir(exist_ok=True)

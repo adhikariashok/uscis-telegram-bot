@@ -10,11 +10,9 @@ Commands:
   /help               — show help
 """
 import asyncio
-import html
 import logging
 import threading
 import re
-import urllib.request
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -29,14 +27,6 @@ logger = logging.getLogger(__name__)
 _app: Application | None = None
 _loop: asyncio.AbstractEventLoop | None = None
 _RECEIPT_RE = re.compile(r"^[A-Z]{3}\d{10}$")
-_CODE_RE = re.compile(r"^[A-Z0-9]{2,6}$")
-_NIEM_DEF_URL = (
-    "https://niem.github.io/model/5.0/scr/"
-    "BenefitDocumentStatusCategoryCodeSimpleType/"
-)
-_NIEM_MAP: dict[str, str] = {}
-_NIEM_MAP_READY = False
-_NIEM_MAP_LOCK = threading.Lock()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -76,87 +66,33 @@ def _register_user(update: Update):
     upsert_user(user.id, user.username or user.first_name or "")
 
 
-def _normalize_code(value: str) -> str:
-    cleaned = ""
-    cleaned = re.sub(r"[^A-Za-z0-9]", "", str(value or ""))
-    return cleaned.upper().strip()
-
-
-def _load_niem_map():
-    global _NIEM_MAP_READY
-
-    content = ""
-    plain = ""
-    line = ""
-    code = ""
-    label = ""
-    match = None
-
-    if _NIEM_MAP_READY:
-        return
-
-    with _NIEM_MAP_LOCK:
-        if _NIEM_MAP_READY:
-            return
-        try:
-            with urllib.request.urlopen(_NIEM_DEF_URL, timeout=10) as resp:
-                content = resp.read().decode("utf-8", errors="ignore")
-        except Exception as exc:
-            logger.warning("Could not load NIEM status definitions: %s", exc)
-            _NIEM_MAP_READY = True
-            return
-
-        plain = re.sub(r"<[^>]+>", "\n", content)
-        plain = html.unescape(plain)
-        for line in plain.splitlines():
-            line = " ".join(line.strip().split())
-            if not line:
-                continue
-            match = re.match(
-                r"^([A-Z0-9]{2,6})\s+([A-Z][A-Z0-9 ,./()'&;:-]{4,})$",
-                line,
-            )
-            if not match:
-                continue
-            code = match.group(1).strip().upper()
-            label = match.group(2).strip()
-            if not _CODE_RE.match(code):
-                continue
-            if len(label) > 180:
-                continue
-            _NIEM_MAP[code] = label
-        _NIEM_MAP_READY = True
-
-
 def _event_label(event: dict) -> str:
-    raw = ""
-    code = ""
-    mapped = ""
-
-    _load_niem_map()
-
-    for raw in [
-        event.get("eventCode"),
-        event.get("statusCategoryCode"),
-        event.get("actionType"),
-        event.get("code"),
-    ]:
-        code = _normalize_code(raw)
-        if not code:
-            continue
-        mapped = _NIEM_MAP.get(code, "")
-        if mapped:
-            return f"{code} - {mapped}"
-
-    for raw in [
-        event.get("description"),
-        event.get("title"),
-        event.get("actionType"),
-        event.get("eventCode"),
-    ]:
-        if raw:
-            return str(raw).strip()
+    for key in ["description", "title", "actionType", "eventCode"]:
+        val = event.get(key)
+        if val:
+            return str(val).strip()
     return ""
+
+
+def _allowed_ids() -> set[int]:
+    from config import load_config
+    raw = load_config().get("allowed_telegram_ids", "")
+    if not raw:
+        return set()
+    ids: set[int] = set()
+    for part in str(raw).split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+
+def _is_authorized(update: Update) -> bool:
+    allowed = _allowed_ids()
+    if not allowed:
+        return True
+    user = update.effective_user
+    return user is not None and user.id in allowed
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
@@ -253,6 +189,9 @@ async def cmd_addaccount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = ""
 
     _register_user(update)
+    if not _is_authorized(update):
+        await _reply(update, "❌ You are not authorized to use this command.")
+        return
     name = ctx.args[0].lower().strip() if ctx.args else "new"
     if not name.replace("_", "").replace("-", "").isalnum():
         await _reply(
