@@ -139,6 +139,19 @@ def get_case_history(receipt_number: str, telegram_id: int = None) -> list:
         return [dict(r) for r in cur.fetchall()]
 
 
+def get_last_history_entry(receipt_number: str, telegram_id: int) -> dict | None:
+    with _conn() as con:
+        con.row_factory = sqlite3.Row
+        cur = con.execute(
+            """SELECT * FROM case_history
+               WHERE receipt_number = ? AND telegram_id = ?
+               ORDER BY recorded_at DESC LIMIT 1""",
+            (receipt_number.upper(), telegram_id),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+
 def get_all_history_for_user(telegram_id: int) -> list:
     with _conn() as con:
         con.row_factory = sqlite3.Row

@@ -8,7 +8,7 @@ import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from config import load_config
-from database import get_all_cases, update_case_status, log_case_history
+from database import get_all_cases, update_case_status, log_case_history, get_last_history_entry
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,16 @@ def _check_all():
         changed = (old_status != new_status) or (old_hash and old_hash != new_hash)
         first_poll = receipt not in _seen_this_session
         _seen_this_session.add(receipt)
+
+        # On first poll after startup, log a baseline only if history is empty
+        # or the last recorded entry differs — avoids duplicates across restarts
+        if first_poll and not changed:
+            last = get_last_history_entry(receipt, tid)
+            first_poll = (
+                last is None
+                or last.get("status") != new_status
+                or last.get("updated_at") != new_updated
+            )
 
         # Always update the DB (even if unchanged, to refresh last_checked)
         update_case_status(receipt, new_status, new_updated, new_hash)
