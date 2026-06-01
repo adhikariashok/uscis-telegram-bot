@@ -159,10 +159,13 @@ def fetch_case(receipt_number: str, account: str = "primary",
                _retry_after_refresh: bool = True) -> dict | None:
     """
     Returns normalised case dict (with 'events_hash' key) or None on failure.
-    Returns {"_session_expired": True} if the auth session needs a full re-login.
-    On a 401, attempts one silent refresh before giving up.
+    When the auth session is expired and cannot be silently refreshed, falls
+    back to the public egov API so monitoring continues in degraded mode.
+    The returned dict includes '_session_expired': True in that case so the
+    caller can notify the user to re-login.
     """
     receipt = receipt_number.upper()
+    session_expired = False
 
     # ── 1. Authenticated my.uscis.gov ─────────────────────────────────────────
     auth_session = build_requests_session(account)
@@ -191,7 +194,10 @@ def fetch_case(receipt_number: str, account: str = "primary",
                         if ok:
                             logger.info("Silent refresh succeeded — retrying fetch for %s", receipt)
                             return fetch_case(receipt, account, _retry_after_refresh=False)
-                    return {"_session_expired": True, "receipt_number": receipt, "account": account}
+                    # Silent refresh failed (or skipped on retry); mark expired and
+                    # fall through to public API so monitoring continues.
+                    session_expired = True
+                    break
             except Exception as exc:
                 logger.warning("Auth endpoint %s error: %s", url, exc)
 
@@ -203,12 +209,18 @@ def fetch_case(receipt_number: str, account: str = "primary",
         if resp.status_code == 200:
             result = _parse_public(resp.json(), receipt)
             result["events_hash"] = _events_hash(result)
-            logger.info("Fetched %s via public API", receipt)
+            if session_expired:
+                result["_session_expired"] = True
+                result["account"] = account
+            logger.info("Fetched %s via public API%s", receipt,
+                        " (auth expired)" if session_expired else "")
             return result
         logger.warning("Public API returned HTTP %d for %s", resp.status_code, receipt)
     except Exception as exc:
         logger.error("Public API failed for %s: %s", receipt, exc)
 
+    if session_expired:
+        return {"_session_expired": True, "receipt_number": receipt, "account": account}
     return None
 
 

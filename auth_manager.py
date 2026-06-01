@@ -18,6 +18,10 @@ from config import APP_DIR, KEY_PATH, USCIS_LOGIN_URL, USCIS_DASHBOARD_URL
 
 logger = logging.getLogger(__name__)
 
+# Tracks accounts for which we've already sent a session-expiry warning this
+# process lifetime — prevents the warning from firing every 30 minutes.
+_expiry_warned: set[str] = set()
+
 
 # ── Encryption helpers ────────────────────────────────────────────────────────
 
@@ -106,6 +110,45 @@ def has_session(account: str = "primary") -> bool:
     if account == "primary" and (APP_DIR / "session.enc").exists():
         return True
     return _session_path(account).exists()
+
+
+def get_session_expiry(account: str = "primary") -> float | None:
+    """
+    Return the earliest known session hard-deadline as a Unix timestamp.
+    Checks the Okta refresh-token expiresAt in localStorage, then falls back
+    to common session cookies (sid, JSESSIONID, usi_session).
+    Returns None if no expiry information is available.
+    """
+    data = load_session(account)
+    if not data:
+        return None
+
+    expiry: float | None = None
+
+    for value in (data.get("local_storage") or {}).values():
+        try:
+            obj = json.loads(value)
+            if not isinstance(obj, dict):
+                continue
+            # Okta token storage keeps the refresh token's hard deadline here
+            rt = obj.get("refreshToken") or {}
+            rt_exp = rt.get("expiresAt")
+            if rt_exp:
+                rt_exp = float(rt_exp)
+                if expiry is None or rt_exp < expiry:
+                    expiry = rt_exp
+        except Exception:
+            pass
+
+    for c in data.get("cookies", []):
+        if c.get("name") in ("sid", "JSESSIONID", "usi_session"):
+            exp = c.get("expires", 0)
+            if exp and exp > 0:
+                exp = float(exp)
+                if expiry is None or exp < expiry:
+                    expiry = exp
+
+    return expiry
 
 
 def list_accounts() -> list[str]:
@@ -676,20 +719,27 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
                      new_local_storage or data.get("local_storage") or {})
         logger.info("Silent refresh succeeded for '%s'.", account)
 
-        # Warn if the Okta session cookie will expire soon (3-hour hard limit).
+        # Warn if the Okta session cookie will expire soon.
         # The sid cookie carries the absolute session expiry set at login time;
         # no amount of token renewal can push it past that boundary.
+        # We warn at 8 hours so the user has time to re-login before the session
+        # dies — especially useful before a long absence (weekend, travel, etc.).
+        # The _expiry_warned set ensures we send at most one warning per account
+        # per process lifetime so the alert isn't repeated every 30 minutes.
         try:
             for c in raw:
                 if c.get("name") in ("sid", "JSESSIONID", "usi_session"):
                     exp = c.get("expires", 0)
                     if exp and exp > 0:
                         remaining = exp - time.time()
-                        if remaining < 3600:
-                            mins = int(remaining / 60)
+                        if remaining < 8 * 3600 and account not in _expiry_warned:
+                            _expiry_warned.add(account)
+                            hours = int(remaining / 3600)
+                            mins = int((remaining % 3600) / 60)
+                            time_str = f"{hours}h {mins}min" if hours else f"{mins} min"
                             _alert(
-                                f"⚠️ USCIS session for *{account}* expires in ~{mins} min.\n"
-                                "Please re-login via the tray icon to avoid interruption."
+                                f"⚠️ USCIS session for *{account}* expires in ~{time_str}.\n"
+                                "Please re-login via the tray icon before it expires."
                             )
         except Exception:
             pass

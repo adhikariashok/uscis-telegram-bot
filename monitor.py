@@ -5,6 +5,7 @@ send_notification(telegram_id, message) for any case that changed.
 """
 import json
 import logging
+from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from config import load_config
@@ -37,7 +38,8 @@ def _check_all():
             logger.warning("No data returned for %s", receipt)
             continue
 
-        # Session expired — tell the user once per poll cycle
+        # Session expired — notify the user once per poll cycle, but still
+        # process whatever public-API data came back so status updates continue.
         if result.get("_session_expired"):
             key = (tid, account)
             if key not in session_expired_notified:
@@ -45,9 +47,13 @@ def _check_all():
                     _notify_fn(
                         tid,
                         f"⚠️ USCIS session expired for *{account}* account.\n"
-                        "Open the tray icon → *Re-login* to restore monitoring.",
+                        "Monitoring continues via public API (limited data).\n"
+                        "Open the tray icon → *Re-login* to restore full monitoring.",
                     )
                 session_expired_notified.add(key)
+
+        # If there's no status (pure error sentinel with no public-API fallback), skip
+        if not result.get("status"):
             continue
 
         new_status = result["status"]
@@ -153,18 +159,20 @@ def start(notify_fn):
         max_instances=1,
         coalesce=True,
     )
-    # Refresh OAuth tokens every 45 minutes. Okta access tokens expire in ~1 hour;
-    # refreshing at 45-minute intervals ensures we renew while the token is still
-    # valid (15-minute buffer) rather than racing against expiry.
+    # Refresh OAuth tokens every 30 minutes. Okta access tokens expire in ~1 hour;
+    # refreshing at 30-minute intervals keeps a comfortable margin.
+    # next_run_time=datetime.now() fires immediately on startup so the session
+    # is validated (and any expiry warning sent) without waiting 30 minutes.
     _scheduler.add_job(
         _refresh_all_sessions,
-        trigger=IntervalTrigger(minutes=45),
+        trigger=IntervalTrigger(minutes=30),
         id="session_refresh",
+        next_run_time=datetime.now(),
         max_instances=1,
         coalesce=True,
     )
     _scheduler.start()
-    logger.info("Monitor started — polling every %d seconds, refreshing sessions every 45 minutes.", interval)
+    logger.info("Monitor started — polling every %d seconds, refreshing sessions every 30 minutes.", interval)
 
 
 def stop():
