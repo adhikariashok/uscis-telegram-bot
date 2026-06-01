@@ -106,7 +106,11 @@ def _start_services(token: str):
 
     import threading
 
-    threading.Timer(5.0, monitor.trigger_now).start()
+    # Delay the first case poll until after the startup session refresh
+    # has time to complete for all accounts (~30s per account).
+    # 5 seconds was too short — it raced with the headless Chrome refresh,
+    # locking the Chrome profile and causing "Headless Chrome did not start".
+    threading.Timer(120.0, monitor.trigger_now).start()
     return monitor
 
 

@@ -114,7 +114,7 @@ def _check_all():
 
 
 def _refresh_all_sessions():
-    """Silently refresh OAuth tokens for every saved account."""
+    """Run the browser-based session keep-alive for every saved account."""
     from auth_manager import list_accounts, silent_refresh_session
 
     accounts = list_accounts()
@@ -159,20 +159,23 @@ def start(notify_fn):
         max_instances=1,
         coalesce=True,
     )
-    # Refresh OAuth tokens every 30 minutes. Okta access tokens expire in ~1 hour;
-    # refreshing at 30-minute intervals keeps a comfortable margin.
+    # Browser-based session keep-alive every 20 minutes. myUSCIS auth rides on
+    # short-lived Akamai/AWS-WAF bot tokens (e.g. __cf_bm ~30 min) that a plain
+    # `requests` poll can't regenerate; a real headless Chrome visit re-issues
+    # them. 20 min stays ahead of the ~30-min token TTL so the requests poller
+    # never starts hitting expired bot tokens.
     # next_run_time=datetime.now() fires immediately on startup so the session
-    # is validated (and any expiry warning sent) without waiting 30 minutes.
+    # is validated (and any expiry warning sent) without waiting.
     _scheduler.add_job(
         _refresh_all_sessions,
-        trigger=IntervalTrigger(minutes=30),
+        trigger=IntervalTrigger(minutes=20),
         id="session_refresh",
         next_run_time=datetime.now(),
         max_instances=1,
         coalesce=True,
     )
     _scheduler.start()
-    logger.info("Monitor started — polling every %d seconds, refreshing sessions every 30 minutes.", interval)
+    logger.info("Monitor started — polling every %d seconds, refreshing sessions every 20 minutes.", interval)
 
 
 def stop():

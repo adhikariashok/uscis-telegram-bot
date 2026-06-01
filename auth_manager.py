@@ -22,6 +22,35 @@ logger = logging.getLogger(__name__)
 # process lifetime — prevents the warning from firing every 30 minutes.
 _expiry_warned: set[str] = set()
 
+# The cookies that actually carry the authenticated myUSCIS session. This site
+# is Rails session-cookie auth behind Akamai/AWS bot protection — NOT Okta/OAuth.
+# (The trailing names are legacy/other-environment variants kept for safety.)
+_SESSION_COOKIE_NAMES = (
+    "_uscis_user_session",
+    "_myuscis_session_rx",
+    "_uscis_userservices_session",
+    "sid", "JSESSIONID", "usi_session",
+)
+
+
+def _normalize_cdp_cookie(c: dict) -> dict:
+    """
+    Keep every field we need to (a) replay the cookie via requests and
+    (b) reason about its lifetime. CDP returns `expires` as a Unix timestamp
+    (-1 for session cookies). Dropping it — as the old code did — is why
+    get_session_expiry() could never find a deadline.
+    """
+    return {
+        "name": c["name"],
+        "value": c["value"],
+        "domain": c.get("domain", ""),
+        "path": c.get("path", "/"),
+        "secure": c.get("secure", False),
+        "httpOnly": c.get("httpOnly", False),
+        "sameSite": c.get("sameSite", ""),
+        "expires": c.get("expires", -1),
+    }
+
 
 # ── Encryption helpers ────────────────────────────────────────────────────────
 
@@ -115,8 +144,10 @@ def has_session(account: str = "primary") -> bool:
 def get_session_expiry(account: str = "primary") -> float | None:
     """
     Return the earliest known session hard-deadline as a Unix timestamp.
-    Checks the Okta refresh-token expiresAt in localStorage, then falls back
-    to common session cookies (sid, JSESSIONID, usi_session).
+    Reads the `expires` of the real myUSCIS auth cookies (see
+    _SESSION_COOKIE_NAMES). Many of them are session cookies (no expiry), in
+    which case the deadline is server-side only and we return None.
+    A defensive Okta refresh-token check is kept for other environments.
     Returns None if no expiry information is available.
     """
     data = load_session(account)
@@ -130,7 +161,7 @@ def get_session_expiry(account: str = "primary") -> float | None:
             obj = json.loads(value)
             if not isinstance(obj, dict):
                 continue
-            # Okta token storage keeps the refresh token's hard deadline here
+            # Okta token storage (if present) keeps the refresh token's deadline
             rt = obj.get("refreshToken") or {}
             rt_exp = rt.get("expiresAt")
             if rt_exp:
@@ -141,7 +172,7 @@ def get_session_expiry(account: str = "primary") -> float | None:
             pass
 
     for c in data.get("cookies", []):
-        if c.get("name") in ("sid", "JSESSIONID", "usi_session"):
+        if c.get("name") in _SESSION_COOKIE_NAMES:
             exp = c.get("expires", 0)
             if exp and exp > 0:
                 exp = float(exp)
@@ -405,14 +436,7 @@ def _capture_from_tab(port: int) -> tuple[list, dict, dict]:
         except Exception:
             pass
 
-    cookies = [
-        {
-            "name": c["name"], "value": c["value"],
-            "domain": c.get("domain", ""), "path": c.get("path", "/"),
-            "secure": c.get("secure", False),
-        }
-        for c in raw_cookies
-    ]
+    cookies = [_normalize_cdp_cookie(c) for c in raw_cookies]
     # Log domain breakdown to help diagnose empty captures
     from collections import Counter
     domains = Counter(
@@ -509,8 +533,20 @@ def capture_session(account: str = "primary", status_callback=None) -> bool:
 
 def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
     """
-    Headless Chrome loads existing cookies, navigates to the dashboard so the
-    browser silently refreshes OAuth tokens, then saves the fresh cookies.
+    Keep the authenticated myUSCIS session alive.
+
+    Relaunches headless Chrome on the SAME persistent profile used at login —
+    so it already holds the live Rails session cookies plus the short-lived
+    Akamai/AWS-WAF bot tokens (__cf_bm, aws-waf-token, bm_sv, …) that a plain
+    `requests` poll cannot regenerate on its own. Navigating to the dashboard
+    with a real browser refreshes those tokens and re-stamps the session, then
+    we capture the full fresh jar back to disk.
+
+    We deliberately do NOT re-inject the previously-saved cookies before
+    navigating: the on-disk .enc is only ever a snapshot of a past capture, so
+    it can never be fresher than the profile's own jar — injecting it can only
+    clobber good cookies with stale values.
+
     Returns True on success, False if a full re-login is needed.
     """
     def _alert(msg):
@@ -565,34 +601,13 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
         _cdp_send(ws, "Network.enable", {}, cmd); cmd += 1
         _cdp_send(ws, "Page.enable", {}, cmd); cmd += 1
 
-        # Inject the most recently saved cookies BEFORE navigating.
-        # The Chrome profile dir may have stale/expired cookies from the previous
-        # refresh attempt; injecting the saved session gives the browser (and the
-        # Okta SDK) the freshest starting state so it can silently renew the token.
-        saved_cookies = data.get("cookies", [])
-        if saved_cookies:
-            cdp_cookies = [
-                {
-                    "name": c["name"], "value": c["value"],
-                    "domain": c.get("domain", ""),
-                    "path": c.get("path", "/"),
-                    "secure": c.get("secure", False),
-                }
-                for c in saved_cookies
-                if c.get("domain") and c.get("value")
-            ]
-            if cdp_cookies:
-                try:
-                    _cdp_send(ws, "Network.setCookies", {"cookies": cdp_cookies}, cmd); cmd += 1
-                    logger.info("Silent refresh [%s]: pre-injected %d cookies before navigation",
-                                account, len(cdp_cookies))
-                except Exception as exc:
-                    logger.warning("Silent refresh [%s]: cookie pre-inject failed: %s", account, exc)
-
-        # Navigate to the dashboard now that the cookie jar is primed
+        # No cookie injection — the persistent profile already carries the live
+        # session + WAF jar (see docstring). Just navigate the dashboard with a
+        # real browser so Akamai/AWS-WAF re-issue their bot tokens and the Rails
+        # session is re-stamped.
         _cdp_send(ws, "Page.navigate", {"url": USCIS_DASHBOARD_URL}, cmd); cmd += 1
 
-        # Give Okta SDK time to complete its silent token renewal
+        # Let the page (and any bot-protection JS challenge) settle before capture
         time.sleep(25)
 
         # Check we landed on an authenticated page (not redirected to login)
@@ -670,14 +685,7 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
             _alert(f"Silent refresh captured no cookies for *{account}*.")
             return False
 
-        cookies = [
-            {
-                "name": c["name"], "value": c["value"],
-                "domain": c.get("domain", ""), "path": c.get("path", "/"),
-                "secure": c.get("secure", False),
-            }
-            for c in raw
-        ]
+        cookies = [_normalize_cdp_cookie(c) for c in raw]
 
         # Verify new cookies in memory BEFORE saving — the Chrome profile can
         # serve a cached page that looks authenticated while the actual session
@@ -719,28 +727,31 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
                      new_local_storage or data.get("local_storage") or {})
         logger.info("Silent refresh succeeded for '%s'.", account)
 
-        # Warn if the Okta session cookie will expire soon.
-        # The sid cookie carries the absolute session expiry set at login time;
-        # no amount of token renewal can push it past that boundary.
-        # We warn at 8 hours so the user has time to re-login before the session
-        # dies — especially useful before a long absence (weekend, travel, etc.).
-        # The _expiry_warned set ensures we send at most one warning per account
-        # per process lifetime so the alert isn't repeated every 30 minutes.
+        # Warn if an auth cookie carries an absolute expiry that's approaching.
+        # Some myUSCIS auth cookies are session-only (no expiry) — in that case
+        # the deadline is server-side and we simply can't see it, so no warning.
+        # When an expiry IS present, no amount of keep-alive can push past it.
+        # We warn at 8 hours so the user can re-login before a long absence.
+        # The _expiry_warned set sends at most one warning per account per
+        # process lifetime so the alert isn't repeated every refresh cycle.
         try:
+            earliest = None
             for c in raw:
-                if c.get("name") in ("sid", "JSESSIONID", "usi_session"):
+                if c.get("name") in _SESSION_COOKIE_NAMES:
                     exp = c.get("expires", 0)
-                    if exp and exp > 0:
-                        remaining = exp - time.time()
-                        if remaining < 8 * 3600 and account not in _expiry_warned:
-                            _expiry_warned.add(account)
-                            hours = int(remaining / 3600)
-                            mins = int((remaining % 3600) / 60)
-                            time_str = f"{hours}h {mins}min" if hours else f"{mins} min"
-                            _alert(
-                                f"⚠️ USCIS session for *{account}* expires in ~{time_str}.\n"
-                                "Please re-login via the tray icon before it expires."
-                            )
+                    if exp and exp > 0 and (earliest is None or exp < earliest):
+                        earliest = exp
+            if earliest is not None:
+                remaining = earliest - time.time()
+                if remaining < 8 * 3600 and account not in _expiry_warned:
+                    _expiry_warned.add(account)
+                    hours = int(remaining / 3600)
+                    mins = int((remaining % 3600) / 60)
+                    time_str = f"{hours}h {mins}min" if hours else f"{mins} min"
+                    _alert(
+                        f"⚠️ USCIS session for *{account}* expires in ~{time_str}.\n"
+                        "Please re-login via the tray icon before it expires."
+                    )
         except Exception:
             pass
 
