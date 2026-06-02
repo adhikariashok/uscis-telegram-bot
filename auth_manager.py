@@ -9,6 +9,7 @@ import logging
 import os
 import socket
 import subprocess
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -21,6 +22,21 @@ logger = logging.getLogger(__name__)
 # Tracks accounts for which we've already sent a session-expiry warning this
 # process lifetime — prevents the warning from firing every 30 minutes.
 _expiry_warned: set[str] = set()
+
+# ── Refresh serialization / throttling ────────────────────────────────────────
+# Two chrome instances cannot share one --user-data-dir profile. The 5-min poll
+# fires one refresh per case on 401, and the 20-min keep-alive fires one per
+# account — without coordination these launch overlapping headless Chromes on the
+# same profile, which lock each other out ("Headless Chrome did not start") and
+# leave orphaned processes. _refresh_lock serializes every browser refresh, and
+# _REFRESH_COOLDOWN lets a just-completed refresh be reused instead of relaunched.
+_refresh_lock = threading.Lock()
+_last_refresh: dict[str, tuple[float, bool]] = {}   # account -> (unix_ts, success)
+_REFRESH_COOLDOWN = 180.0  # seconds
+
+# Accounts we've already told the user need a manual re-login this episode.
+# Cleared on the next successful refresh so a fresh expiry alerts again.
+_relogin_alerted: set[str] = set()
 
 # The cookies that actually carry the authenticated myUSCIS session. This site
 # is Rails session-cookie auth behind Akamai/AWS bot protection — NOT Okta/OAuth.
@@ -297,6 +313,83 @@ def _cdp_send(ws, method: str, params: dict, cmd_id: int) -> dict:
             return msg.get("result", {})
 
 
+def _kill_chrome(proc: "subprocess.Popen | None", profile_dir: str | None = None) -> None:
+    """
+    Fully tear down the Chrome we launched.
+
+    proc.terminate()/killing proc.pid is NOT enough: with --headless=new the
+    process we Popen is just a launcher that spawns a DETACHED browser process
+    (a different parent) and exits. Those children survive, keep the profile's
+    LOCK held, and pile up as orphans — which is exactly what then makes the
+    next refresh fail with "Headless Chrome did not start".
+
+    So we kill two ways: (1) proc's own process tree, and (2) — the reliable one —
+    every chrome.exe whose command line points at THIS account's profile dir.
+    Refreshes are serialized per profile by _refresh_lock, so (2) can only ever
+    match Chromes from this same refresh.
+    """
+    try:
+        import psutil
+    except Exception:
+        psutil = None
+
+    if psutil is not None:
+        targets = []
+        if proc is not None:
+            try:
+                parent = psutil.Process(proc.pid)
+                targets += parent.children(recursive=True) + [parent]
+            except psutil.NoSuchProcess:
+                pass
+        if profile_dir:
+            needle = os.path.normcase(os.path.abspath(profile_dir))
+            for p in psutil.process_iter(["name", "cmdline"]):
+                try:
+                    name = (p.info.get("name") or "").lower()
+                    if "chrome" not in name:
+                        continue
+                    cl = os.path.normcase(" ".join(p.info.get("cmdline") or []))
+                    if needle in cl:
+                        targets.append(p)
+                except Exception:
+                    pass
+        for p in targets:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        try:
+            psutil.wait_procs(targets, timeout=5)
+        except Exception:
+            pass
+        return
+
+    # Fallback when psutil is unavailable: taskkill the launcher's tree.
+    if proc is not None:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+def _account_receipt(account: str) -> str | None:
+    """A receipt number registered under this account, used to verify auth."""
+    try:
+        from database import get_all_cases
+        for c in get_all_cases():
+            if c.get("account", "primary") == account:
+                return c["receipt_number"].upper()
+    except Exception as exc:
+        logger.debug("Could not look up a receipt for '%s': %s", account, exc)
+    return None
+
+
 def _launch_chrome(port: int, profile_dir: str, url: str, headless: bool = False) -> subprocess.Popen:
     chrome = _find_chrome()
     if not chrome:
@@ -478,7 +571,7 @@ def capture_session(account: str = "primary", status_callback=None) -> bool:
 
     if not _wait_for_cdp(port):
         _cb("Chrome did not start in time.")
-        proc.terminate()
+        _kill_chrome(proc, profile_dir)
         return False
 
     _cb("Waiting for you to log in — the browser will close automatically.")
@@ -497,7 +590,7 @@ def capture_session(account: str = "primary", status_callback=None) -> bool:
 
     if not logged_in:
         _cb("Login timed out (5 minutes). Please try again from the tray icon.")
-        proc.terminate()
+        _kill_chrome(proc, profile_dir)
         return False
 
     # Wait a moment for any final token-refresh XHR calls to complete
@@ -513,10 +606,7 @@ def capture_session(account: str = "primary", status_callback=None) -> bool:
         logger.exception("Cookie capture failed for '%s': %s", account, exc)
         _cb(f"Could not capture cookies: {exc}")
     finally:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+        _kill_chrome(proc, profile_dir)
         time.sleep(1)
         # Persistent profile dir is intentionally kept — reused by silent_refresh_session
 
@@ -533,50 +623,77 @@ def capture_session(account: str = "primary", status_callback=None) -> bool:
 
 def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
     """
-    Keep the authenticated myUSCIS session alive.
+    Keep the authenticated myUSCIS session alive — and silently re-login when the
+    server's hard session cap (~8h, no keep-alive can extend it) is hit.
 
-    Relaunches headless Chrome on the SAME persistent profile used at login —
-    so it already holds the live Rails session cookies plus the short-lived
-    Akamai/AWS-WAF bot tokens (__cf_bm, aws-waf-token, bm_sv, …) that a plain
-    `requests` poll cannot regenerate on its own. Navigating to the dashboard
-    with a real browser refreshes those tokens and re-stamps the session, then
-    we capture the full fresh jar back to disk.
+    Relaunches headless Chrome on the persistent login profile and navigates the
+    login entry URL. While the app session is still alive this just re-stamps it;
+    once it has expired, hitting the entry URL lets USCIS's remembered-device SSO
+    mint a brand-new session with no user interaction — provided MFA isn't
+    demanded. Success is confirmed by an in-browser authenticated fetch to the
+    real case API returning HTTP 200; a cached SPA shell can fake the landed URL,
+    so the URL alone is never trusted. Only verified-good cookies are saved.
 
-    We deliberately do NOT re-inject the previously-saved cookies before
-    navigating: the on-disk .enc is only ever a snapshot of a past capture, so
-    it can never be fresher than the profile's own jar — injecting it can only
-    clobber good cookies with stale values.
+    Serialized by _refresh_lock and throttled by _REFRESH_COOLDOWN so the 5-min
+    poll (one call per case) and the 20-min keep-alive can never launch
+    overlapping headless Chromes on the same profile.
 
-    Returns True on success, False if a full re-login is needed.
+    Returns True if the session is confirmed alive, False if a manual re-login
+    is needed (e.g. SSO also expired or MFA required).
     """
+    if not load_session(account):
+        return False
+
+    with _refresh_lock:
+        ts, ok = _last_refresh.get(account, (0.0, False))
+        if time.time() - ts < _REFRESH_COOLDOWN:
+            logger.info(
+                "Silent refresh [%s]: within %ds cooldown — reusing last result (ok=%s)",
+                account, int(_REFRESH_COOLDOWN), ok,
+            )
+            return ok
+
+        result = _do_silent_refresh(account, notify_fn)
+        _last_refresh[account] = (time.time(), result)
+        if result:
+            _relogin_alerted.discard(account)
+            _expiry_warned.discard(account)
+        return result
+
+
+def _do_silent_refresh(account: str, notify_fn=None) -> bool:
+    """Heavy lifting for silent_refresh_session. Assumes the caller holds
+    _refresh_lock so no other Chrome is touching this profile."""
     def _alert(msg):
         logger.info("Silent refresh [%s]: %s", account, msg)
         if notify_fn:
             notify_fn(msg)
 
-    data = load_session(account)
-    if not data:
-        return False
+    def _alert_relogin():
+        # One "please re-login" message per expiry episode (re-armed on success).
+        if account in _relogin_alerted:
+            return
+        _relogin_alerted.add(account)
+        _alert(
+            f"⚠️ USCIS session for *{account}* has fully expired and could not be "
+            "renewed automatically (a re-login with verification is required).\n"
+            "Open the tray icon → *Re-login* to restore full monitoring."
+        )
 
     if not _find_chrome():
         _alert("Chrome not found — cannot refresh session.")
         return False
 
+    data = load_session(account)
     port = _free_port()
-    # Reuse the persistent profile from login — preserves Okta cookies, localStorage,
-    # and IndexedDB so the Okta SDK can silently renew the refresh token itself.
     profile_path = _chrome_profile_dir(account)
     profile_dir = str(profile_path)
 
-    # Clear any stale lock files left by a previously crashed Chrome process.
-    # A locked profile causes headless Chrome to exit immediately without ever
-    # exposing the CDP endpoint (shows as "Headless Chrome did not start").
+    # Clear stale lock files from any previously crashed Chrome so the launch
+    # isn't rejected for an "in use" profile.
     _clear_chrome_locks(profile_path)
 
     try:
-        # Start headless Chrome on about:blank so we can inject cookies before
-        # navigating — avoids the race where Chrome opens the dashboard before
-        # the CDP session is ready to set cookies.
         proc = _launch_chrome(port, profile_dir, "about:blank", headless=True)
     except Exception as exc:
         _alert(f"Could not launch headless Chrome: {exc}")
@@ -584,7 +701,7 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
 
     if not _wait_for_cdp(port):
         _alert("Headless Chrome did not start.")
-        proc.terminate()
+        _kill_chrome(proc, profile_dir)
         return False
 
     success = False
@@ -601,36 +718,61 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
         _cdp_send(ws, "Network.enable", {}, cmd); cmd += 1
         _cdp_send(ws, "Page.enable", {}, cmd); cmd += 1
 
-        # No cookie injection — the persistent profile already carries the live
-        # session + WAF jar (see docstring). Just navigate the dashboard with a
-        # real browser so Akamai/AWS-WAF re-issue their bot tokens and the Rails
-        # session is re-stamped.
-        _cdp_send(ws, "Page.navigate", {"url": USCIS_DASHBOARD_URL}, cmd); cmd += 1
+        # Navigate the LOGIN entry URL (not the deep dashboard link): when the app
+        # session has hit its cap, this is what triggers the remembered-device SSO
+        # handshake that re-mints a fresh session. When it's still alive, the entry
+        # URL simply redirects to the dashboard and re-stamps it.
+        _cdp_send(ws, "Page.navigate", {"url": USCIS_LOGIN_URL}, cmd); cmd += 1
 
-        # Let the page (and any bot-protection JS challenge) settle before capture
-        time.sleep(25)
+        # Let navigation, any SSO redirects, and the bot-protection JS settle.
+        time.sleep(22)
 
-        # Check we landed on an authenticated page (not redirected to login)
         result = _cdp_send(ws, "Runtime.evaluate",
                            {"expression": "window.location.href", "returnByValue": True}, cmd)
         cmd += 1
         current_url = result.get("result", {}).get("value", "")
         logger.info("Silent refresh [%s] landed on: %s", account, current_url)
 
-        if "login" in current_url or "my.uscis.gov" not in current_url:
-            ws.close()
-            _alert(
-                f"Session for *{account}* has fully expired — silent refresh failed.\n"
-                "Please re-login via the tray icon."
+        # Authoritative auth check: make a real authenticated request to the case
+        # API from inside the browser (carries the fresh WAF/CF tokens) and require
+        # HTTP 200. This both PROVES the session is live and re-stamps it. A cached
+        # dashboard shell can render while logged-out, so we never trust the URL.
+        receipt = _account_receipt(account)
+        api_status = None
+        if receipt:
+            fetch_js = (
+                "(async () => { try {"
+                "  const r = await fetch("
+                "    'https://my.uscis.gov/account/case-service/api/cases/" + receipt + "',"
+                "    {credentials:'include', headers:{'Accept':'application/json'}});"
+                "  return r.status;"
+                "} catch(e) { return -1; } })()"
             )
-            return False
+            result = _cdp_send(ws, "Runtime.evaluate",
+                               {"expression": fetch_js, "returnByValue": True,
+                                "awaitPromise": True}, cmd)
+            cmd += 1
+            api_status = result.get("result", {}).get("value")
+            logger.info("Silent refresh [%s]: in-browser API check -> HTTP %s",
+                        account, api_status)
+            if api_status != 200:
+                ws.close()
+                _alert_relogin()
+                return False
+        else:
+            # No registered case to verify against — fall back to the URL heuristic.
+            if "login" in current_url or "my.uscis.gov" not in current_url:
+                ws.close()
+                _alert_relogin()
+                return False
+            logger.info("Silent refresh [%s]: no receipt to verify with — "
+                        "trusting landed URL.", account)
 
-        # Get fresh cookies
+        # Session confirmed alive — capture the fresh jar.
         result = _cdp_send(ws, "Network.getAllCookies", {}, cmd); cmd += 1
         raw = result.get("cookies", [])
         logger.info("Silent refresh [%s]: %d cookies collected", account, len(raw))
 
-        # Get auth token from localStorage
         extra_headers: dict = {}
         token_js = """(function(){
             try {
@@ -657,7 +799,6 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
         except Exception:
             pass
 
-        # Capture refreshed localStorage (updated Okta tokens)
         new_local_storage: dict = {}
         ls_js = """(function(){
             try {
@@ -686,75 +827,12 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
             return False
 
         cookies = [_normalize_cdp_cookie(c) for c in raw]
-
-        # Verify new cookies in memory BEFORE saving — the Chrome profile can
-        # serve a cached page that looks authenticated while the actual session
-        # is dead. If we save first and verify second, we destroy good working
-        # cookies before we know the new ones are bad.
-        import requests as _req
-        test_sess = _req.Session()
-        for c in cookies:
-            test_sess.cookies.set(
-                c["name"], c["value"],
-                domain=c.get("domain", ""), path=c.get("path", "/"),
-            )
-        if extra_headers:
-            test_sess.headers.update(extra_headers)
-        test_sess.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json",
-        })
-        try:
-            r = test_sess.get("https://my.uscis.gov/api/cases", timeout=10)
-            if r.status_code in (401, 403):
-                logger.warning(
-                    "Silent refresh [%s]: new cookies are dead (HTTP %d) — keeping existing session.",
-                    account, r.status_code,
-                )
-                _alert(
-                    f"⚠️ Session for *{account}* has fully expired — silent refresh failed.\n"
-                    "Please re-login via the tray icon."
-                )
-                return False
-        except Exception as exc:
-            logger.warning("Silent refresh [%s]: pre-save verify error: %s — saving anyway.", account, exc)
-
         save_session(cookies, extra_headers, account,
-                     new_local_storage or data.get("local_storage") or {})
-        logger.info("Silent refresh succeeded for '%s'.", account)
-
-        # Warn if an auth cookie carries an absolute expiry that's approaching.
-        # Some myUSCIS auth cookies are session-only (no expiry) — in that case
-        # the deadline is server-side and we simply can't see it, so no warning.
-        # When an expiry IS present, no amount of keep-alive can push past it.
-        # We warn at 8 hours so the user can re-login before a long absence.
-        # The _expiry_warned set sends at most one warning per account per
-        # process lifetime so the alert isn't repeated every refresh cycle.
-        try:
-            earliest = None
-            for c in raw:
-                if c.get("name") in _SESSION_COOKIE_NAMES:
-                    exp = c.get("expires", 0)
-                    if exp and exp > 0 and (earliest is None or exp < earliest):
-                        earliest = exp
-            if earliest is not None:
-                remaining = earliest - time.time()
-                if remaining < 8 * 3600 and account not in _expiry_warned:
-                    _expiry_warned.add(account)
-                    hours = int(remaining / 3600)
-                    mins = int((remaining % 3600) / 60)
-                    time_str = f"{hours}h {mins}min" if hours else f"{mins} min"
-                    _alert(
-                        f"⚠️ USCIS session for *{account}* expires in ~{time_str}.\n"
-                        "Please re-login via the tray icon before it expires."
-                    )
-        except Exception:
-            pass
-
+                     new_local_storage or (data.get("local_storage") if data else {}) or {})
+        if api_status == 200:
+            logger.info("Silent refresh confirmed live session for '%s' (API 200).", account)
+        else:
+            logger.info("Silent refresh saved session for '%s'.", account)
         success = True
 
     except Exception as exc:
@@ -764,10 +842,7 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
             "Please re-login via the tray icon if monitoring stops."
         )
     finally:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+        _kill_chrome(proc, profile_dir)
         time.sleep(1)
         # Persistent profile dir is intentionally kept
 

@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 _scheduler: BackgroundScheduler | None = None
 _notify_fn = None   # set by start()
 _seen_this_session: set[str] = set()  # receipt numbers polled at least once since startup
+# Accounts we've already warned about an expired session this episode. Persists
+# across poll cycles (so the warning isn't re-sent every 5 min) and is cleared
+# for an account as soon as a healthy fetch comes back, re-arming the warning.
+_expired_notified: set = set()
 
 
 def _check_all():
@@ -24,8 +28,6 @@ def _check_all():
     cases = get_all_cases()
     if not cases:
         return
-
-    session_expired_notified = set()
 
     for case in cases:
         receipt = case["receipt_number"]
@@ -38,19 +40,23 @@ def _check_all():
             logger.warning("No data returned for %s", receipt)
             continue
 
-        # Session expired — notify the user once per poll cycle, but still
-        # process whatever public-API data came back so status updates continue.
+        # Session expired — auto re-login (in fetch_case) has already tried and
+        # failed. Warn the user just ONCE per expiry episode, not every cycle.
+        # Re-armed below when a healthy fetch returns for this account.
         if result.get("_session_expired"):
             key = (tid, account)
-            if key not in session_expired_notified:
+            if key not in _expired_notified:
+                _expired_notified.add(key)
                 if _notify_fn:
                     _notify_fn(
                         tid,
-                        f"⚠️ USCIS session expired for *{account}* account.\n"
-                        "Monitoring continues via public API (limited data).\n"
+                        f"⚠️ USCIS session expired for *{account}* account and could "
+                        "not be renewed automatically.\n"
                         "Open the tray icon → *Re-login* to restore full monitoring.",
                     )
-                session_expired_notified.add(key)
+        else:
+            # Healthy result for this account — re-arm the expiry warning.
+            _expired_notified.discard((tid, account))
 
         # If there's no status (pure error sentinel with no public-API fallback), skip
         if not result.get("status"):
