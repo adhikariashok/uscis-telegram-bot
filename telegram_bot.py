@@ -135,6 +135,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/report` — download a CSV report of all history\n"
         "`/accounts` — show saved USCIS accounts\n"
         "`/addaccount wife` — login and save a new account session\n"
+        "`/relogin [account]` — refresh session (auto if .env creds set)\n"
         "`/help` — show this message",
     )
 
@@ -247,6 +248,86 @@ async def cmd_addaccount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_relogin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    accounts = []
+    loop = None
+    ok = False
+    name = ""
+    auto = False
+
+    _register_user(update)
+    if not _is_authorized(update):
+        await _reply(update, "❌ You are not authorized to use this command.")
+        return
+
+    from account_credentials import has_auto_login_credentials
+
+    name = ctx.args[0].lower().strip() if ctx.args else "primary"
+    accounts = list_accounts()
+    auto = has_auto_login_credentials(name)
+
+    if not accounts:
+        await _reply(
+            update,
+            "No saved accounts found yet.\n"
+            "Run `/addaccount <name>` first.",
+        )
+        return
+
+    if len(ctx.args) == 0 and "primary" not in accounts and len(accounts) == 1:
+        name = accounts[0]
+
+    if name not in accounts:
+        await _reply(
+            update,
+            f"Account *{name}* is not saved.\n"
+            "Use `/accounts` to list accounts, or "
+            "`/addaccount <name>` to create one.",
+        )
+        return
+
+    if auto:
+        await _reply(
+            update,
+            f"Starting automated re-login for *{name}* "
+            "(credentials + Gmail MFA from .env)...",
+        )
+    else:
+        await _reply(
+            update,
+            f"Starting re-login for *{name}*.\n\n"
+            "Please complete USCIS login in Chrome. "
+            "I will confirm once the session is refreshed.",
+        )
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(None, capture_session, name, None)
+
+    if ok:
+        await _reply(
+            update,
+            f"✅ Re-login complete for *{name}*.\n"
+            "Monitoring should resume on the next check.",
+        )
+        return
+
+    from auth_manager import last_capture_error
+
+    detail = last_capture_error(name)
+    fail_msg = f"❌ Re-login failed for *{name}*."
+    if detail:
+        fail_msg += f"\n\n{detail}"
+    elif auto:
+        fail_msg += (
+            "\n\nCheck `GMAIL_APP_PASSWORD_1` in .env "
+            "(16-char Gmail App Password)."
+        )
+    else:
+        fail_msg += (
+            "\n\nTry `/relogin <account>` again and finish login in Chrome."
+        )
+    await _reply(update, fail_msg)
+
+
 async def cmd_unregister(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _register_user(update)
     if not ctx.args:
@@ -316,7 +397,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif result.get("_session_expired"):
             await _reply(
                 update,
-                "⚠️ USCIS session expired. Please re-login via the Windows tray app.",
+                f"⚠️ USCIS session expired for *{account}*.\n"
+                f"Run `/relogin {account}` to restore full monitoring.",
             )
         else:
             events_text = ""
@@ -504,6 +586,7 @@ async def _bot_main(token: str):
     _app.add_handler(CommandHandler("status", cmd_status))
     _app.add_handler(CommandHandler("accounts", cmd_accounts))
     _app.add_handler(CommandHandler("addaccount", cmd_addaccount))
+    _app.add_handler(CommandHandler("relogin", cmd_relogin))
     _app.add_handler(CommandHandler("history", cmd_history))
     _app.add_handler(CommandHandler("report", cmd_report))
     _app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))

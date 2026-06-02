@@ -9,8 +9,10 @@ import logging
 import os
 import socket
 import subprocess
+import threading
 import time
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 from cryptography.fernet import Fernet
@@ -21,6 +23,31 @@ logger = logging.getLogger(__name__)
 # Tracks accounts for which we've already sent a session-expiry warning this
 # process lifetime — prevents the warning from firing every 30 minutes.
 _expiry_warned: set[str] = set()
+_last_capture_error: dict[str, str] = {}
+
+
+def last_capture_error(account: str) -> str:
+    return _last_capture_error.get(account, "")
+_profile_locks: dict[str, threading.Lock] = {}
+_profile_locks_guard = threading.Lock()
+
+
+@contextmanager
+def _chrome_profile_lock(account: str):
+    """
+    Only one Chrome/Playwright session per account profile at a time.
+    Prevents silent refresh and /relogin from racing on the same dir.
+    """
+    lock = None
+    with _profile_locks_guard:
+        if account not in _profile_locks:
+            _profile_locks[account] = threading.Lock()
+        lock = _profile_locks[account]
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 # The cookies that actually carry the authenticated myUSCIS session. This site
 # is Rails session-cookie auth behind Akamai/AWS bot protection — NOT Okta/OAuth.
@@ -448,26 +475,110 @@ def _capture_from_tab(port: int) -> tuple[list, dict, dict]:
     return cookies, extra_headers, local_storage
 
 
+# ── Automated re-login (credentials in .env) ───────────────────────────────────
+
+def _try_automated_relogin(account: str, notify_fn=None) -> bool:
+    """Attempt Playwright login when silent refresh fails."""
+    creds = None
+    result = None
+
+    from account_credentials import load_account_credentials
+
+    creds = load_account_credentials(account)
+    if not creds:
+        return False
+
+    logger.info(
+        "Silent refresh failed for '%s' — trying automated re-login.",
+        account,
+    )
+    if notify_fn:
+        notify_fn(
+            f"Session expired for *{account}* — running automated re-login..."
+        )
+
+    result = capture_session(account)
+    if result and notify_fn:
+        notify_fn(f"✅ Automated re-login succeeded for *{account}*.")
+    return result
+
+
 # ── Interactive browser login ─────────────────────────────────────────────────
 
 def capture_session(account: str = "primary", status_callback=None) -> bool:
     """
-    Opens real Chrome (no Selenium/WebDriver — completely undetectable),
-    waits for the user to finish logging in by watching the tab URL via CDP,
-    then captures cookies automatically and closes Chrome.
-    No dialogs or prompts shown to the user.
+    Save a fresh USCIS session for *account*.
+
+    If USCIS_EMAIL / USCIS_PASSWORD / GMAIL_APP_PASSWORD are set for the
+    account (see account_credentials.py), runs fully automated Playwright
+    login with email MFA. Otherwise opens Chrome for manual login via CDP.
     """
     def _cb(msg):
         logger.info(msg)
         if status_callback:
             status_callback(msg)
 
+    from account_credentials import load_account_credentials
+
+    with _chrome_profile_lock(account):
+        return _capture_session_locked(
+            account, status_callback, _cb,
+        )
+
+
+def _capture_session_locked(
+    account: str,
+    status_callback,
+    _cb,
+) -> bool:
+    creds = None
+    result = None
+    profile_path = None
+    port = 0
+    profile_dir = ""
+    proc = None
+    logged_in = False
+    deadline = 0.0
+    cookies = []
+    extra_headers = {}
+    local_storage = {}
+
+    from account_credentials import load_account_credentials
+
+    _last_capture_error.pop(account, None)
+    creds = load_account_credentials(account)
+    if creds:
+        from uscis_auto_login import automated_login_capture
+
+        profile_path = _chrome_profile_dir(account)
+        _clear_chrome_locks(profile_path)
+        result = automated_login_capture(
+            profile_path,
+            creds["email"],
+            creds["password"],
+            creds["gmail_app_password"],
+            account=account,
+            headless=True,
+            status_callback=status_callback,
+        )
+        if not result:
+            return False
+        cookies, extra_headers, local_storage = result
+        save_session(cookies, extra_headers, account, local_storage)
+        _cb(
+            f"Session saved for '{account}' — "
+            f"{len(cookies)} cookies (automated login)."
+        )
+        return True
+
     if not _find_chrome():
         _cb("Chrome not found. Please install Google Chrome.")
         return False
 
+    profile_path = _chrome_profile_dir(account)
+    _clear_chrome_locks(profile_path)
     port = _free_port()
-    profile_dir = str(_chrome_profile_dir(account))
+    profile_dir = str(profile_path)
 
     _cb(f"Launching Chrome for '{account}' account...")
     try:
@@ -496,7 +607,7 @@ def capture_session(account: str = "primary", status_callback=None) -> bool:
         time.sleep(1)
 
     if not logged_in:
-        _cb("Login timed out (5 minutes). Please try again from the tray icon.")
+        _cb("Login timed out (5 minutes). Try `/relogin` again.")
         proc.terminate()
         return False
 
@@ -558,13 +669,23 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
     if not data:
         return False
 
+    with _chrome_profile_lock(account):
+        return _silent_refresh_locked(account, data, notify_fn, _alert)
+
+
+def _silent_refresh_locked(account, data, notify_fn, _alert) -> bool:
+    port = 0
+    profile_path = None
+    profile_dir = ""
+    proc = None
+    success = False
+    auto_relogin = False
+
     if not _find_chrome():
         _alert("Chrome not found — cannot refresh session.")
         return False
 
     port = _free_port()
-    # Reuse the persistent profile from login — preserves Okta cookies, localStorage,
-    # and IndexedDB so the Okta SDK can silently renew the refresh token itself.
     profile_path = _chrome_profile_dir(account)
     profile_dir = str(profile_path)
 
@@ -587,7 +708,6 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
         proc.terminate()
         return False
 
-    success = False
     try:
         import websocket
 
@@ -619,10 +739,7 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
 
         if "login" in current_url or "my.uscis.gov" not in current_url:
             ws.close()
-            _alert(
-                f"Session for *{account}* has fully expired — silent refresh failed.\n"
-                "Please re-login via the tray icon."
-            )
+            auto_relogin = True
             return False
 
         # Get fresh cookies
@@ -715,10 +832,7 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
                     "Silent refresh [%s]: new cookies are dead (HTTP %d) — keeping existing session.",
                     account, r.status_code,
                 )
-                _alert(
-                    f"⚠️ Session for *{account}* has fully expired — silent refresh failed.\n"
-                    "Please re-login via the tray icon."
-                )
+                auto_relogin = True
                 return False
         except Exception as exc:
             logger.warning("Silent refresh [%s]: pre-save verify error: %s — saving anyway.", account, exc)
@@ -750,7 +864,7 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
                     time_str = f"{hours}h {mins}min" if hours else f"{mins} min"
                     _alert(
                         f"⚠️ USCIS session for *{account}* expires in ~{time_str}.\n"
-                        "Please re-login via the tray icon before it expires."
+                        f"Run `/relogin {account}` before it expires."
                     )
         except Exception:
             pass
@@ -761,7 +875,7 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
         logger.exception("Silent refresh error for '%s': %s", account, exc)
         _alert(
             f"Silent refresh error for *{account}*: {exc}\n"
-            "Please re-login via the tray icon if monitoring stops."
+            f"If monitoring stops, run `/relogin {account}` in Telegram."
         )
     finally:
         try:
@@ -770,6 +884,15 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
             pass
         time.sleep(1)
         # Persistent profile dir is intentionally kept
+
+    if auto_relogin:
+        if _try_automated_relogin(account, _alert):
+            return True
+        _alert(
+            f"Session for *{account}* has fully expired — silent refresh failed.\n"
+            f"Run `/relogin {account}` in Telegram."
+        )
+        return False
 
     return success
 

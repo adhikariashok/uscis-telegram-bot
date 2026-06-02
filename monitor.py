@@ -48,7 +48,7 @@ def _check_all():
                         tid,
                         f"⚠️ USCIS session expired for *{account}* account.\n"
                         "Monitoring continues via public API (limited data).\n"
-                        "Open the tray icon → *Re-login* to restore full monitoring.",
+                        f"Run `/relogin {account}` to restore full monitoring.",
                     )
                 session_expired_notified.add(key)
 

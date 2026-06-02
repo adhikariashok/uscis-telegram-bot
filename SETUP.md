@@ -9,246 +9,503 @@ Complete step-by-step instructions to get the app running from scratch.
 1. [Prerequisites](#1-prerequisites)
 2. [Get the Code](#2-get-the-code)
 3. [Install the App](#3-install-the-app)
-4. [Create a Telegram Bot](#4-create-a-telegram-bot)
-5. [First Run & Setup Wizard](#5-first-run--setup-wizard)
-6. [Log In to myUSCIS](#6-log-in-to-myuscis)
-7. [Register Your Cases](#7-register-your-cases)
-8. [Adding a Second Account](#8-adding-a-second-account-eg-spouse)
-9. [Running in the Background](#9-running-in-the-background)
-10. [Troubleshooting](#10-troubleshooting)
+4. [Configure `.env`](#4-configure-env)
+5. [Create a Telegram Bot](#5-create-a-telegram-bot)
+6. [First Run](#6-first-run)
+7. [Log In to myUSCIS](#7-log-in-to-myuscis)
+8. [Register Your Cases](#8-register-your-cases)
+9. [Adding a Second Account](#9-adding-a-second-account-eg-spouse)
+10. [Session Refresh & Re-login](#10-session-refresh--re-login)
+11. [Running in the Background](#11-running-in-the-background)
+12. [Telegram Commands](#12-telegram-commands)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Data Location](#14-data-location)
 
 ---
 
 ## 1. Prerequisites
 
-Install all three before continuing.
+Install all of the following before continuing.
 
 ### Python 3.13
 
 1. Go to [python.org/downloads](https://www.python.org/downloads/)
-2. Download **Python 3.13** (the latest 3.13.x release)
-3. Run the installer — **check "Add Python to PATH"** before clicking Install
+2. Download **Python 3.13**
+3. Run the installer — on Windows, check **"Add Python to PATH"**
 
-Verify in a terminal:
+Verify:
+
+```bash
+python3 --version
+# or on Windows: py -3.13 --version
 ```
-py -3.13 --version
-```
-Expected output: `Python 3.13.x`
+
+Expected: `Python 3.13.x`
 
 ### Google Chrome
 
-Download from [google.com/chrome](https://www.google.com/chrome/) if you don't already have it.
-Any recent version works.
+Download from [google.com/chrome](https://www.google.com/chrome/).
+Required for session capture and background refresh.
 
 ### Telegram
 
-Install Telegram on your phone or desktop from [telegram.org](https://telegram.org).
-You need a Telegram account to receive notifications.
+Install from [telegram.org](https://telegram.org).
+You need an account to receive notifications.
+
+### Playwright (automated login on macOS/Linux)
+
+If you use **automated login** (recommended on macOS), install Playwright
+browsers after the Python dependencies:
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```
 
 ---
 
 ## 2. Get the Code
 
 **Option A — Clone with Git:**
-```
-git clone https://github.com/YOUR_USERNAME/uscis-monitor.git
-cd uscis-monitor
+
+```bash
+git clone https://github.com/YOUR_USERNAME/uscis-telegram-bot.git
+cd uscis-telegram-bot
 ```
 
 **Option B — Download ZIP:**
-1. Click the green **Code** button on GitHub
-2. Click **Download ZIP**
-3. Extract to a folder of your choice (e.g. `C:\uscis-monitor`)
+
+1. Click **Code → Download ZIP** on GitHub
+2. Extract to a folder of your choice
 
 ---
 
 ## 3. Install the App
 
-Double-click **`install.bat`** inside the folder.
+### Windows
+
+Double-click **`install.bat`**.
 
 The installer will:
+
 - Create a Python virtual environment
-- Install all dependencies
+- Install dependencies
 - Create a desktop shortcut
 
-> If Windows asks "Do you want to allow this app to make changes?" — click **Yes**.
+Then use **`run.bat`** or the desktop shortcut to start (tray mode).
 
-If the installer fails, see [Troubleshooting](#10-troubleshooting).
+### macOS / Linux
+
+```bash
+cd uscis-telegram-bot
+python3 -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+playwright install chromium
+cp .env.example .env
+```
+
+Edit `.env` (see next section), then start headless mode:
+
+```bash
+python main.py --mode headless
+```
 
 ---
 
-## 4. Create a Telegram Bot
+## 4. Configure `.env`
 
-You need your own private Telegram bot. This takes about 2 minutes.
+Copy the template and edit the root `.env` file:
+
+```bash
+cp .env.example .env
+```
+
+### Required
+
+| Variable | Description |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Token from @BotFather |
+
+### Optional — security
+
+| Variable | Description |
+|---|---|
+| `ALLOWED_TELEGRAM_IDS` | Comma-separated Telegram user IDs allowed to run `/addaccount` and `/relogin`. Get your ID from @userinfobot. Leave empty to allow all users (not recommended on a public bot). |
+
+### Optional — automated USCIS login (recommended on macOS)
+
+Enables **hands-free** `/relogin` and automatic recovery when a session
+expires. The bot signs in to myUSCIS, reads the MFA code from Gmail via
+IMAP, and saves the session — no manual Chrome window.
+
+**Primary account** (use either set of names):
+
+```bash
+USCIS_EMAIL=you@gmail.com
+USCIS_PASSWORD=your-myuscis-password
+GMAIL_APP_PASSWORD=xxxxxxxxxxxxxxxx
+```
+
+**Or immigration-style numbered vars** (work for any account label if
+account-specific vars are not set):
+
+```bash
+USCIS_EMAIL_1=you@gmail.com
+USCIS_PASSWORD_1=your-myuscis-password
+GMAIL_APP_PASSWORD_1=xxxxxxxxxxxxxxxx
+```
+
+**Named account** (example label `boris`):
+
+```bash
+USCIS_EMAIL_BORIS=you@gmail.com
+USCIS_PASSWORD_BORIS=your-myuscis-password
+GMAIL_APP_PASSWORD_BORIS=xxxxxxxxxxxxxxxx
+```
+
+#### Gmail App Password
+
+1. Enable **2-Step Verification** on your Google Account
+2. Open [App passwords](https://myaccount.google.com/apppasswords)
+3. Create a password for **Mail**
+4. Paste the **16-character** password into `.env` (spaces are OK; do not
+   add quotes or extra characters like `%`)
+
+Use the **same Gmail address** as `USCIS_EMAIL` — USCIS sends MFA codes
+there.
+
+> **Privacy:** Credentials stay in `.env` on your machine only. They are
+> never sent to third parties except myUSCIS and Gmail (for MFA).
+
+---
+
+## 5. Create a Telegram Bot
 
 1. Open Telegram and search for **@BotFather**
 2. Send `/newbot`
-3. Choose a name (e.g. `My USCIS Monitor`)
-4. Choose a username ending in `bot` (e.g. `myuscismonitor_bot`)
-5. BotFather will reply with a token like:
-   ```
-   123456789:ABCdefGHIjklMNOpqrSTUvwxYZ
-   ```
-6. **Copy that token** — you'll need it in the next step
+3. Choose a display name and a username ending in `bot`
+4. Copy the token (format: `123456789:ABCdef...`)
+5. Paste it into `.env` as `TELEGRAM_BOT_TOKEN`
 
 ---
 
-## 5. First Run & Setup Wizard
+## 6. First Run
 
-Double-click **`run.bat`** (or the desktop shortcut created by the installer).
+### Windows (tray mode — default)
 
-A setup wizard window will appear:
+1. Double-click **`run.bat`**
+2. Complete the **setup wizard** (bot token, optional manual USCIS login)
+3. Look for the blue icon in the system tray
 
-**Step 1 — Telegram Bot Token**
-- Paste the token you copied from BotFather
-- The token should start with numbers followed by a colon
+### macOS / Linux (headless mode — default)
 
-**Step 2 — Log in to myUSCIS**
-- Click **"Open USCIS Login Browser"**
-- A Chrome window will open automatically (see next section)
+```bash
+source venv/bin/activate
+python main.py --mode headless
+```
 
-**Step 3 — Save**
-- Click **"Save & Start Monitoring"**
+You should see:
 
----
+```
+Telegram bot polling started.
+Monitor started — polling every 300 seconds...
+```
 
-## 6. Log In to myUSCIS
+Open your bot in Telegram and send `/start`.
 
-When you click "Open USCIS Login Browser":
+**Optional — setup wizard on any OS:**
 
-1. A Chrome window opens pointing to **my.uscis.gov**
-2. Log in with your myUSCIS credentials (via login.gov)
-3. Once you reach your **dashboard or account page**, wait a moment
-4. **Chrome will close automatically** — this means the session was captured
-
-> You do not need to click anything in the app. Chrome closing itself is the success signal.
-
-The app silently refreshes your session every 10 minutes in the background, so you should **never need to log in again** unless you manually clear your session data.
+```bash
+python setup_wizard.py
+```
 
 ---
 
-## 7. Register Your Cases
+## 7. Log In to myUSCIS
 
-Open Telegram and find the bot you created. Send:
+You need a saved USCIS session before registering cases. Choose **one**
+method.
+
+### Method A — Automated login (recommended)
+
+Requires `USCIS_EMAIL`, `USCIS_PASSWORD`, and `GMAIL_APP_PASSWORD` in
+`.env` (see [section 4](#4-configure-env)).
+
+In Telegram:
+
+```
+/addaccount boris
+```
+
+or, to refresh an existing account:
+
+```
+/relogin boris
+```
+
+The bot will:
+
+1. Open a headless browser and sign in to myUSCIS
+2. Wait for the MFA email from `uscis.dhs.gov`
+3. Read the 6-digit code from Gmail (IMAP)
+4. Complete MFA and save the encrypted session
+
+You should get a success message in Telegram within about a minute.
+
+### Method B — Manual login (Chrome window)
+
+Use this if you do not want credentials in `.env`, or automated login
+fails.
+
+**Windows:** Right-click tray icon → **Add Account…**, or use Telegram:
+
+```
+/addaccount wife
+```
+
+**macOS / Linux:** Telegram only (no tray):
+
+```
+/addaccount primary
+```
+
+A **visible Chrome window** opens:
+
+1. Log in to myUSCIS (login.gov)
+2. Reach your **dashboard**
+3. Chrome closes automatically when the session is captured
+
+---
+
+## 8. Register Your Cases
+
+In Telegram (replace with your receipt number):
 
 ```
 /register IOE1234567890
 ```
 
-Replace `IOE1234567890` with your actual USCIS receipt number (found on your I-797 Notice of Action).
+With a named account:
 
-**Check status manually:**
 ```
-/status
-```
-
-**List all tracked cases:**
-```
-/list
+/register IOE1234567890 boris
 ```
 
-**Stop monitoring a case:**
+**Other commands:**
+
 ```
+/status          # check all cases now
+/status IOE123   # one case
+/list            # cases you track
 /unregister IOE1234567890
 ```
 
-You'll receive a Telegram message automatically whenever the case status, updated timestamp, or event timeline changes.
+You receive a Telegram message when status, timestamps, or events change.
 
 ---
 
-## 8. Adding a Second Account (e.g. Spouse)
+## 9. Adding a Second Account (e.g. Spouse)
 
-If you want to monitor cases tied to a different myUSCIS login (e.g. your spouse's account):
+Each account has its own encrypted session file and label (e.g. `wife`,
+`boris`).
 
-**From the tray icon:**
-1. Right-click the **USCIS Monitor** icon in the taskbar (bottom-right)
-2. Click **Add Account**
-3. Type a label when prompted — e.g. `wife`
-4. A Chrome window opens — log in with your spouse's myUSCIS credentials
-5. Chrome closes automatically when done
+1. Add credentials to `.env` (automated) **or** run `/addaccount wife`
+   (manual Chrome login)
+2. Register cases with the label:
 
-**Register cases under the new account:**
 ```
 /register IOE0000000000 wife
 ```
 
-**Check which accounts are saved:**
+3. List saved accounts:
+
 ```
 /accounts
 ```
 
-**Re-login for a specific account** (if the session expires):
-- Right-click tray icon → **Re-login (wife)**
+---
+
+## 10. Session Refresh & Re-login
+
+The monitor **refreshes sessions every 20 minutes** in the background
+(headless Chrome on the saved profile).
+
+If a session expires, you may get:
+
+```
+⚠️ USCIS session expired for boris account.
+Run /relogin boris in Telegram to restore full monitoring.
+```
+
+**With automated login configured:**
+
+```
+/relogin boris
+```
+
+Runs headless — no action needed on your Mac/PC.
+
+**Without automated login:**
+
+```
+/relogin boris
+```
+
+Opens Chrome; complete login manually.
+
+> Only one login operation runs per account at a time. Wait for startup
+> refresh to finish before sending `/relogin` right after a restart.
 
 ---
 
-## 9. Running in the Background
+## 11. Running in the Background
 
-The app runs silently with no console window. To confirm it's running, look for the **blue circular icon** in your Windows system tray (bottom-right taskbar area — you may need to click the `^` arrow to see it).
+### Windows (tray)
 
-**Right-click the tray icon for options:**
-- **Check Now** — run an immediate poll of all cases
-- **Add Account** — add a new USCIS account
-- **Re-login (primary)** — re-authenticate if a session expires
-- **View Log** — open the live log viewer for debugging
-- **Settings** — reopen the setup wizard to change the bot token
-- **Exit** — stop the app
+- App runs from `run.bat` with no console window
+- Tray icon (bottom-right, may be under `^`)
+- **Check Now**, **Add Account**, **Re-login**, **View Log**, **Settings**, **Exit**
+- Auto-start: copy desktop shortcut to `shell:startup`
 
-**To start on Windows login:**
-- Copy the desktop shortcut to your Startup folder:
-  Press `Win + R`, type `shell:startup`, press Enter, then drag the shortcut in.
+### macOS / Linux (headless)
 
----
+Keep a terminal open, or run as a service, e.g. with `launchd` or
+`systemd`. Example:
 
-## 10. Troubleshooting
+```bash
+cd /path/to/uscis-telegram-bot
+source venv/bin/activate
+nohup python main.py --mode headless >> ~/.uscis_monitor/nohup.log 2>&1 &
+```
 
-### "Python not found" during install
+Logs: `~/.uscis_monitor/monitor.log` (or path in `LOG_PATH`).
 
-- Make sure Python 3.13 is installed from [python.org](https://www.python.org/downloads/)
-- During installation, ensure **"Add Python to PATH"** was checked
-- Try restarting your terminal/PowerShell after installing Python
+### Run modes
 
-### Chrome closes immediately / no cookies captured
-
-- Make sure you fully logged in and reached the **dashboard** (`my.uscis.gov/account/...`) before Chrome closes
-- If Chrome closes too fast, it may have failed to connect to myUSCIS — try again from **Re-login** in the tray menu
-- Check **View Log** in the tray for detailed error messages
-
-### Session expired — getting alerts on Telegram
-
-- Right-click the tray icon → **Re-login (primary)** (or the relevant account name)
-- Log in again in the Chrome window that opens
-- Chrome will close automatically when done
-
-### Bot not responding in Telegram
-
-1. Make sure `run.bat` was started (check for the tray icon)
-2. Open **View Log** from the tray — look for `Telegram bot polling started`
-3. Verify your bot token is correct via **Settings** in the tray
-
-### "No cases being monitored" after `/list`
-
-- Register a case first: `/register IOE1234567890`
-- Make sure you used the correct receipt number (e.g. `IOE`, `MSC`, `WAC` prefix)
-
-### App crashes on startup
-
-- Open **View Log** (or find `monitor.log` in `%USERPROFILE%\.uscis_monitor\`)
-- Look for the last error line and open a GitHub Issue with the log
+| Mode | Command | Default on |
+|---|---|---|
+| Tray | `python main.py --mode tray` | Windows |
+| Headless | `python main.py --mode headless` | macOS, Linux |
 
 ---
 
-## Data Location
+## 12. Telegram Commands
 
-All user data is stored in `%USERPROFILE%\.uscis_monitor\` — never inside the repo folder:
+| Command | Description |
+|---|---|
+| `/start` | Welcome and command list |
+| `/help` | Same as `/start` |
+| `/register IOE123` | Monitor a case (primary account) |
+| `/register IOE123 wife` | Monitor under named account |
+| `/unregister IOE123` | Stop monitoring |
+| `/status` | Check all your cases |
+| `/status IOE123` | Check one case |
+| `/status wife` | Check all cases for an account |
+| `/list` | List tracked cases |
+| `/history` | Full status change history |
+| `/history IOE123` | History for one case |
+| `/report` | Download CSV report (summary + events) |
+| `/accounts` | List saved USCIS accounts |
+| `/addaccount wife` | Save a new account session |
+| `/relogin` | Refresh session (primary or only account) |
+| `/relogin boris` | Refresh a named account session |
+
+`/addaccount` and `/relogin` use **automated login** when `.env`
+credentials are set; otherwise they open Chrome for manual login.
+
+---
+
+## 13. Troubleshooting
+
+### Python not found
+
+- Install Python 3.13 from [python.org](https://www.python.org/downloads/)
+- On Windows, enable **Add Python to PATH** and restart the terminal
+
+### Chrome did not start in time
+
+- Another login or refresh may be using the same profile — wait 30s and
+  retry `/relogin`
+- Restart the app after a failed login
+- On macOS, ensure Google Chrome is installed
+
+### Re-login failed — Gmail / MFA
+
+- `GMAIL_APP_PASSWORD` must be **16 characters** (Gmail App Password, not
+  your normal Gmail password)
+- No quotes, no trailing `%` or other stray characters in `.env`
+- Same Gmail as `USCIS_EMAIL`
+- Test: enable IMAP in Gmail settings
+- USCIS subject line: **Secure two-step verification notification**
+
+### Re-login failed — USCIS credentials
+
+- Check `USCIS_PASSWORD` in `.env`
+- Soft-lock: wait and try again later
+
+### Session expired alerts but monitoring works
+
+- Limited data may still come from the public API
+- Run `/relogin <account>` for full authenticated monitoring
+
+### Bot not responding
+
+1. Confirm the process is running (`monitor.log` updates)
+2. Look for `Telegram bot polling started` in the log
+3. Verify `TELEGRAM_BOT_TOKEN` in `.env`
+
+### Automated login works on immigration repo but not here
+
+- Use the same `.env` variable names (`USCIS_EMAIL_1`, etc.) or the
+  `_BORIS` suffix for named accounts
+- Run `playwright install chromium` after `pip install`
+
+### View logs
+
+| OS | Log path |
+|---|---|
+| Default | `~/.uscis_monitor/monitor.log` |
+| Windows tray | Right-click tray → **View Log** |
+
+---
+
+## 14. Data Location
+
+All data is stored under **`~/.uscis_monitor/`** (macOS/Linux) or
+**`%USERPROFILE%\.uscis_monitor\`** (Windows) — not inside the repo.
 
 | File | Contents |
 |---|---|
-| `config.json` | Bot token, poll interval |
-| `data.db` | SQLite — registered users and cases |
-| `session_primary.enc` | Encrypted USCIS session (primary account) |
-| `session_wife.enc` | Encrypted session (if you added a second account) |
-| `.fernet_key` | Encryption key (never share this) |
+| `.env` | Bot token and optional login credentials (in repo root) |
+| `data.db` | Registered users and cases |
+| `session_<account>.enc` | Encrypted USCIS session per account |
+| `chrome_profile_<account>/` | Persistent Chrome profile per account |
+| `.fernet_key` | Local encryption key — **never share** |
 | `monitor.log` | Application log |
 
-> To fully reset the app, delete the `%USERPROFILE%\.uscis_monitor\` folder.
+To fully reset: stop the app, delete `~/.uscis_monitor/`, and start over.
+
+---
+
+## Quick reference — macOS headless
+
+```bash
+git clone <repo>
+cd uscis-telegram-bot
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+playwright install chromium
+cp .env.example .env
+# Edit .env: TELEGRAM_BOT_TOKEN, USCIS_EMAIL_1, USCIS_PASSWORD_1,
+#            GMAIL_APP_PASSWORD_1
+python main.py --mode headless
+```
+
+In Telegram:
+
+```
+/addaccount boris
+/register IOE1234567890 boris
+/relogin boris    # when session expires
+```
