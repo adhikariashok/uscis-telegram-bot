@@ -21,13 +21,17 @@ Tray or headless app ──────► Polls every 5 min ──────�
 ```
 
 - Logs into **my.uscis.gov** once using your real Chrome browser
-  - no credentials stored
 - Saves the encrypted session and silently refreshes it every 10 minutes
 - Polls the authenticated USCIS API every 5 minutes for each
   registered case
 - Notifies you via Telegram bot when status, updated timestamp,
   or event timeline changes
 - Supports **multiple USCIS accounts** (e.g. yourself + spouse)
+- **Optional hands-off auto re-login:** the myUSCIS session has a hard
+  ~8-hour server-side lifetime. If you save your credentials (encrypted),
+  the app re-logs-in by itself when the session expires — reading the
+  two-step verification code straight from Gmail — so monitoring never
+  needs manual intervention
 
 ---
 
@@ -35,6 +39,7 @@ Tray or headless app ──────► Polls every 5 min ──────�
 
 - ✅ One-time login — Chrome opens, you log in, session is captured automatically
 - ✅ Silent background session refresh — never expires mid-monitoring
+- ✅ **Automated re-login with email MFA** — optionally store credentials (encrypted) so the app signs back in by itself at the ~8h session cap, reading the verification code from Gmail
 - ✅ Multi-account support — monitor your case and your spouse's case separately
 - ✅ Telegram bot interface — register cases and check status from your phone
 - ✅ Windows system tray mode - lives quietly in your taskbar
@@ -120,7 +125,9 @@ python setup_wizard.py
 | `/history IOE1234567890` | Show full status change history for one specific case |
 | `/report` | Download your complete case history as two CSV files (summary + events detail) |
 | `/accounts` | Show saved USCIS accounts |
-| `/addaccount wife` | Instructions to add a second account |
+| `/addaccount wife` | Add a second account (opens Chrome for a manual login) |
+| `/relogin` | Refresh the primary account's session |
+| `/relogin wife` | Refresh a named account's session (fully automated if credentials are saved) |
 | `/help` | Show all commands |
 
 ---
@@ -250,30 +257,106 @@ to run custom queries across all your cases.
 
 ## Multiple Accounts (e.g. spouse)
 
-1. Right-click the tray icon -> **Add Account**
+Each account is just a named label (`primary`, `wife`, `spouse`, …) with its
+own encrypted session file that refreshes independently. There are two ways to
+add one:
+
+### Option A — Manual login (quickest, no stored password)
+
+1. Right-click the tray icon -> **Add Account** (or send `/addaccount wife`)
 2. Type a label (e.g. `wife`)
-3. Log in with your spouse's myUSCIS credentials
+3. Log in with the account's myUSCIS credentials in the Chrome window that opens
 4. Register their cases: `/register IOE0000000000 wife`
 
-Each account has its own encrypted session file and refreshes independently.
+With this option, when the session hits its ~8-hour cap you'll need to run
+`/relogin wife` and log in again manually.
+
+### Option B — Automated re-login with email MFA (hands-off)
+
+Store the account's credentials (encrypted) once, and the app re-logs-in by
+itself whenever the session expires — no manual step, ever. See the next
+section.
+
+---
+
+## Hands-off Auto Re-login (email MFA)
+
+The myUSCIS session has a **hard ~8-hour server-side lifetime** that no
+keep-alive can extend. To keep monitoring running indefinitely without manual
+logins, save the account's credentials once and the app will sign back in
+automatically, reading the two-step verification code from Gmail.
+
+### Requirements
+
+- The account's **myUSCIS login email must be the Gmail (or Google Workspace)
+  inbox that receives the USCIS verification codes** — the same address is used
+  both to sign in and to read the MFA code over IMAP.
+- A **Gmail App Password** (16 characters) for that inbox. Create one at
+  <https://myaccount.google.com/apppasswords> (requires 2-Step Verification to
+  be enabled on the Google account).
+
+### Setup
+
+Run this once on the host machine, from the project folder, and answer the
+three prompts (the password fields are hidden as you type):
+
+```bash
+python set_credentials.py <account>     # e.g. python set_credentials.py spouse
+```
+
+| Prompt | What to enter |
+|---|---|
+| USCIS email | The Gmail that receives the USCIS MFA codes |
+| USCIS password | The account's myUSCIS password |
+| Gmail App Password | The 16-character app password for that inbox |
+
+The credentials are stored **Fernet-encrypted** at
+`~/.uscis_monitor/credentials_<account>.enc` (using the same local key as the
+session cookies) — they are never written to disk in plaintext and never leave
+your machine.
+
+### Create the first session, then register cases
+
+```
+/relogin spouse                       → signs in, reads the MFA code, saves the session
+/register IOE0000000000 spouse        → start monitoring the account's case(s)
+/status spouse                        → confirm it's fetching
+```
+
+From then on, the app re-logs-in on its own at the ~8h cap. Failed attempts back
+off automatically so a bad password or hiccup can't trip USCIS's soft-lock.
+
+> **Tip:** the recurring auto re-login runs headless. The very first login on a
+> brand-new account profile can occasionally be blocked by bot-protection in
+> headless mode — if `/relogin <account>` fails repeatedly on a fresh account,
+> use `/addaccount <account>` once (a visible Chrome window) to seed the
+> profile; automated headless re-logins work reliably after that.
+
+To stop deleting the verification emails after reading them, set
+`DELETE_MFA_EMAIL=false` in your `.env`.
 
 ---
 
 ## Project Structure
 
 ```
-├── main.py            Entry point — starts bot, monitor, tray
-├── config.py          App-wide constants and config load/save
-├── auth_manager.py    Chrome CDP login + session encryption
-├── uscis_client.py    USCIS API client (authenticated + public fallback)
-├── monitor.py         APScheduler polling + session refresh jobs
-├── telegram_bot.py    python-telegram-bot command handlers
-├── database.py        SQLite — users, cases, and case history
-├── tray_app.py        pystray Windows system tray
-├── setup_wizard.py    First-run tkinter wizard (subprocess)
-├── log_viewer.py      Log viewer (subprocess)
-├── install.bat        One-click installer
-└── run.bat            Launch the app
+├── main.py                 Entry point — starts bot, monitor, tray
+├── config.py               App-wide constants and config load/save
+├── auth_manager.py         Chrome CDP login + session encryption + auto re-login
+├── uscis_auto_login.py     Automated Playwright login with email MFA
+├── credentials.py          Encrypted per-account credential store
+├── account_credentials.py  Credential loading (encrypted store / env)
+├── set_credentials.py      CLI to save encrypted credentials for an account
+├── mfa_email.py            Reads USCIS verification codes from Gmail (IMAP)
+├── uscis_client.py         USCIS API client (authenticated + public fallback)
+├── monitor.py              APScheduler polling + session refresh jobs
+├── telegram_bot.py         python-telegram-bot command handlers
+├── database.py             SQLite — users, cases, and case history
+├── tray_app.py             pystray Windows system tray
+├── setup_wizard.py         First-run tkinter wizard (subprocess)
+├── log_viewer.py           Log viewer (subprocess)
+├── install.bat             One-click installer
+└── run.bat                 Launch the app
 ```
 
 Data is stored in `%USERPROFILE%\.uscis_monitor\` and never
@@ -283,10 +366,15 @@ inside the repo folder.
 
 ## Privacy & Security
 
-- **No credentials are stored.** The app captures browser session
-  cookies and encrypts them on disk with a local key.
-- **No third-party servers.** The app talks only to
-  `my.uscis.gov` and `api.telegram.org`.
+- **Session cookies are encrypted at rest.** The app captures browser
+  session cookies and encrypts them on disk with a local key.
+- **Credentials are optional and encrypted.** By default no password is
+  stored. If you opt into automated re-login (`set_credentials.py`), the
+  USCIS password and Gmail App Password are stored **Fernet-encrypted**
+  with that same local key — never in plaintext.
+- **No third-party servers.** The app talks only to `my.uscis.gov`,
+  `imap.gmail.com` (only when automated re-login is enabled), and
+  `api.telegram.org`.
 - This tool is for personal use to monitor your own USCIS cases.
 
 ---

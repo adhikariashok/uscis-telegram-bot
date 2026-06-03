@@ -24,6 +24,9 @@ _DEFAULTS = {
     # Comma-separated Telegram user IDs allowed to run /addaccount.
     # Leave empty to allow all users (not recommended on a public bot).
     "allowed_telegram_ids": "",
+    # Delete (move to Trash) the USCIS MFA verification email after the code is
+    # read, so the inbox isn't crowded with codes. Set to "false" to keep them.
+    "delete_mfa_email": "true",
 }
 
 

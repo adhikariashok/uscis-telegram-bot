@@ -38,6 +38,22 @@ _REFRESH_COOLDOWN = 180.0  # seconds
 # Cleared on the next successful refresh so a fresh expiry alerts again.
 _relogin_alerted: set[str] = set()
 
+# Last error from an automated/manual capture, surfaced to the user via /relogin.
+_last_capture_error: dict[str, str] = {}
+
+
+def last_capture_error(account: str) -> str:
+    return _last_capture_error.get(account, "")
+
+
+# Backoff for automated (credentialed) re-login: a persistent failure (bad
+# password, Gmail hiccup, USCIS markup change) must not hammer the login form and
+# trip USCIS's soft-lock. Track consecutive failures + earliest next attempt.
+_auto_login_fail: dict[str, int] = {}
+_auto_login_next_at: dict[str, float] = {}
+_AUTO_LOGIN_BACKOFF = (300, 900, 1800, 3600)   # 5m, 15m, 30m, 60m; last repeats
+_AUTO_LOGIN_SOFTLOCK_BACKOFF = 2 * 3600        # 2h if USCIS reports a soft-lock
+
 # The cookies that actually carry the authenticated myUSCIS session. This site
 # is Rails session-cookie auth behind Akamai/AWS bot protection — NOT Okta/OAuth.
 # (The trailing names are legacy/other-environment variants kept for safety.)
@@ -545,16 +561,48 @@ def _capture_from_tab(port: int) -> tuple[list, dict, dict]:
 
 def capture_session(account: str = "primary", status_callback=None) -> bool:
     """
-    Opens real Chrome (no Selenium/WebDriver — completely undetectable),
-    waits for the user to finish logging in by watching the tab URL via CDP,
-    then captures cookies automatically and closes Chrome.
-    No dialogs or prompts shown to the user.
+    Save a fresh USCIS session for `account`.
+
+    If credentials are configured for the account (account_credentials — the
+    encrypted store or .env), runs a fully automated Playwright login with the
+    Gmail MFA code. Otherwise opens real Chrome for a manual login captured via
+    CDP. Serialized on _refresh_lock so it can't race a background session
+    refresh on the same profile.
     """
+    with _refresh_lock:
+        return _capture_session_inner(account, status_callback)
+
+
+def _capture_session_inner(account: str = "primary", status_callback=None) -> bool:
+    """Lock-free capture worker — caller must hold _refresh_lock."""
     def _cb(msg):
         logger.info(msg)
         if status_callback:
             status_callback(msg)
 
+    _last_capture_error.pop(account, None)
+
+    # Automated credentialed login when creds are configured.
+    from account_credentials import load_account_credentials
+    creds = load_account_credentials(account)
+    if creds:
+        from uscis_auto_login import automated_login_capture
+        profile_path = _chrome_profile_dir(account)
+        _kill_chrome(None, str(profile_path))   # reap any stragglers on the profile
+        _clear_chrome_locks(profile_path)
+        result = automated_login_capture(
+            profile_path, creds["email"], creds["password"],
+            creds["gmail_app_password"], account=account,
+            headless=True, status_callback=status_callback,
+        )
+        if not result:
+            return False
+        cookies, extra_headers, local_storage = result
+        save_session(cookies, extra_headers, account, local_storage)
+        _cb(f"Session saved for '{account}' — {len(cookies)} cookies (automated login).")
+        return True
+
+    # Manual CDP login (no credentials configured).
     if not _find_chrome():
         _cb("Chrome not found. Please install Google Chrome.")
         return False
@@ -619,6 +667,81 @@ def capture_session(account: str = "primary", status_callback=None) -> bool:
     return True
 
 
+# ── Automated credentialed re-login (fallback past the ~8h cap) ───────────────
+
+def _alert_manual_relogin(account: str, notify_fn=None) -> None:
+    """One 'please re-login' message per expiry episode (re-armed on success)."""
+    if account in _relogin_alerted:
+        return
+    _relogin_alerted.add(account)
+    from account_credentials import has_auto_login_credentials
+    if has_auto_login_credentials(account):
+        msg = (
+            f"⚠️ USCIS session for *{account}* expired and automated re-login "
+            "did not succeed (will keep retrying with backoff).\n"
+            f"If it persists, run `/relogin {account}` in Telegram."
+        )
+    else:
+        msg = (
+            f"⚠️ USCIS session for *{account}* has fully expired.\n"
+            f"Run `/relogin {account}` in Telegram to restore full monitoring."
+        )
+    logger.info("Silent refresh [%s]: %s", account, msg)
+    if notify_fn:
+        notify_fn(msg)
+
+
+def _automated_relogin(account: str, notify_fn=None) -> bool:
+    """
+    Full credentialed Playwright login (with Gmail MFA) as the fallback when the
+    remembered-device silent refresh can no longer renew the session. Throttled
+    with exponential backoff so repeated failures can't trip USCIS's soft-lock.
+    Caller must hold _refresh_lock (it calls _capture_session_inner directly).
+    Returns True on a confirmed fresh session, False otherwise (incl. no creds
+    or still within backoff).
+    """
+    from account_credentials import load_account_credentials
+    if not load_account_credentials(account):
+        return False  # no creds — only a manual /relogin can recover
+
+    now = time.time()
+    next_at = _auto_login_next_at.get(account, 0.0)
+    if now < next_at:
+        logger.info("Automated re-login [%s]: in backoff %ds more — skipping.",
+                    account, int(next_at - now))
+        return False
+
+    if notify_fn:
+        notify_fn(f"Session for *{account}* expired — attempting automated re-login…")
+
+    ok = False
+    try:
+        ok = _capture_session_inner(account)   # lock already held by caller
+    except Exception as exc:
+        logger.exception("Automated re-login error for '%s': %s", account, exc)
+        _last_capture_error[account] = str(exc)
+
+    if ok:
+        _auto_login_fail.pop(account, None)
+        _auto_login_next_at.pop(account, None)
+        logger.info("Automated re-login succeeded for '%s'.", account)
+        if notify_fn:
+            notify_fn(f"✅ Automated re-login succeeded for *{account}* — monitoring restored.")
+        return True
+
+    fails = _auto_login_fail.get(account, 0) + 1
+    _auto_login_fail[account] = fails
+    err = _last_capture_error.get(account, "")
+    if "soft-lock" in err.lower():
+        delay = _AUTO_LOGIN_SOFTLOCK_BACKOFF
+    else:
+        delay = _AUTO_LOGIN_BACKOFF[min(fails - 1, len(_AUTO_LOGIN_BACKOFF) - 1)]
+    _auto_login_next_at[account] = now + delay
+    logger.warning("Automated re-login [%s]: failed (attempt %d), next in %dmin. %s",
+                   account, fails, int(delay / 60), err[:160])
+    return False
+
+
 # ── Silent (headless) session refresh ────────────────────────────────────────
 
 def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
@@ -654,10 +777,16 @@ def silent_refresh_session(account: str = "primary", notify_fn=None) -> bool:
             return ok
 
         result = _do_silent_refresh(account, notify_fn)
+        if not result:
+            # Remembered-device re-mint failed (session past its ~8h cap). Fall
+            # back to a full credentialed login with Gmail MFA, if creds are set.
+            result = _automated_relogin(account, notify_fn)
         _last_refresh[account] = (time.time(), result)
         if result:
             _relogin_alerted.discard(account)
             _expiry_warned.discard(account)
+        else:
+            _alert_manual_relogin(account, notify_fn)
         return result
 
 
@@ -668,17 +797,6 @@ def _do_silent_refresh(account: str, notify_fn=None) -> bool:
         logger.info("Silent refresh [%s]: %s", account, msg)
         if notify_fn:
             notify_fn(msg)
-
-    def _alert_relogin():
-        # One "please re-login" message per expiry episode (re-armed on success).
-        if account in _relogin_alerted:
-            return
-        _relogin_alerted.add(account)
-        _alert(
-            f"⚠️ USCIS session for *{account}* has fully expired and could not be "
-            "renewed automatically (a re-login with verification is required).\n"
-            "Open the tray icon → *Re-login* to restore full monitoring."
-        )
 
     if not _find_chrome():
         _alert("Chrome not found — cannot refresh session.")
@@ -757,13 +875,11 @@ def _do_silent_refresh(account: str, notify_fn=None) -> bool:
                         account, api_status)
             if api_status != 200:
                 ws.close()
-                _alert_relogin()
                 return False
         else:
             # No registered case to verify against — fall back to the URL heuristic.
             if "login" in current_url or "my.uscis.gov" not in current_url:
                 ws.close()
-                _alert_relogin()
                 return False
             logger.info("Silent refresh [%s]: no receipt to verify with — "
                         "trusting landed URL.", account)
