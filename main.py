@@ -45,14 +45,30 @@ def _release_lock():
 _HERE = Path(__file__).parent
 
 # ── Logging ──────────────────────────────────────────────────────────────────
+from logging.handlers import RotatingFileHandler
+
+# Rotate at 5 MB, keep 3 backups (~20 MB cap) so monitor.log can't grow
+# unbounded — it was previously a single 32 MB file.
+_file_handler = RotatingFileHandler(
+    str(LOG_PATH), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(str(LOG_PATH), encoding="utf-8"),
+        _file_handler,
         logging.StreamHandler(sys.stdout),
     ],
 )
+
+# These libraries log an INFO line for every poll (~every 10s), which is what
+# bloated the log. Keep our own modules at INFO; silence the chatter.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 
