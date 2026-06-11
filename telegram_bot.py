@@ -22,6 +22,7 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler, filters
 )
 from telegram.constants import ParseMode
+from telegram.error import TimedOut, NetworkError, RetryAfter
 from database import upsert_user, add_case, remove_case, get_user_cases, get_case_history, get_all_history_for_user
 from uscis_client import fetch_case
 from auth_manager import capture_session, list_accounts
@@ -35,29 +36,48 @@ _RECEIPT_RE = re.compile(r"^[A-Z]{3}\d{10}$")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-async def _reply(update: Update, text: str, markdown=True):
-    msg = None
-    chat = None
-    mode = None
+async def _reply(update: Update, text: str, markdown=True) -> bool:
+    """Send a reply, retrying transient Telegram network errors.
 
-    msg = update.message
+    Returns True if delivered, False otherwise. Never raises on a network
+    failure — a single timeout posting to api.telegram.org must not abort the
+    whole command handler (which previously left /status stuck on its
+    "Checking status, please wait…" placeholder).
+    """
     mode = ParseMode.MARKDOWN if markdown else None
-    if msg is not None:
-        await msg.reply_text(
-            text,
-            parse_mode=mode,
-        )
-        return
-
+    msg = update.message
     chat = update.effective_chat
-    if chat is not None:
-        await chat.send_message(
-            text=text,
-            parse_mode=mode,
-        )
-        return
 
-    logger.warning("Cannot reply: update has no message/chat.")
+    if msg is None and chat is None:
+        logger.warning("Cannot reply: update has no message/chat.")
+        return False
+
+    attempts = 3
+    delay = 1.0
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if msg is not None:
+                await msg.reply_text(text, parse_mode=mode)
+            else:
+                await chat.send_message(text=text, parse_mode=mode)
+            return True
+        except RetryAfter as e:
+            last_err = e
+            wait = getattr(e, "retry_after", delay) or delay
+            logger.warning("Telegram rate-limited; retrying in %ss", wait)
+            await asyncio.sleep(wait)
+        except (TimedOut, NetworkError) as e:
+            last_err = e
+            logger.warning(
+                "Transient Telegram send error (attempt %d/%d): %s",
+                attempt, attempts, e,
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+
+    logger.error("Failed to deliver reply after %d attempts: %s", attempts, last_err)
+    return False
 
 
 def _register_user(update: Update):
@@ -369,37 +389,43 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for case_row in cases_to_check:
         receipt = case_row["receipt_number"]
         account = case_row.get("account") or "primary"
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, fetch_case, receipt, account
-        )
-        if result is None:
-            await _reply(update, f"❌ Could not fetch status for `{receipt}`. Try again later.")
-        elif result.get("_session_expired"):
-            await _reply(
-                update,
-                "⚠️ USCIS session expired. Please re-login via the Windows tray app.",
+        # Isolate each case: a fetch error or send timeout on one must not
+        # abort the loop and skip the user's remaining cases.
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, fetch_case, receipt, account
             )
-        else:
-            events_text = ""
-            for ev in result.get("events", [])[:5]:
-                ts = (ev.get("eventTimestamp") or ev.get("createdAtTimestamp")
-                      or ev.get("appointmentDateTime") or ev.get("timestamp")
-                      or ev.get("date") or "")[:10]
-                label = _event_label(ev)
-                if label:
-                    events_text += f"\n• {ts} — {label}"
+            if result is None:
+                await _reply(update, f"❌ Could not fetch status for `{receipt}`. Try again later.")
+            elif result.get("_session_expired"):
+                await _reply(
+                    update,
+                    "⚠️ USCIS session expired. Please re-login via the Windows tray app.",
+                )
+            else:
+                events_text = ""
+                for ev in result.get("events", [])[:5]:
+                    ts = (ev.get("eventTimestamp") or ev.get("createdAtTimestamp")
+                          or ev.get("appointmentDateTime") or ev.get("timestamp")
+                          or ev.get("date") or "")[:10]
+                    label = _event_label(ev)
+                    if label:
+                        events_text += f"\n• {ts} — {label}"
 
-            msg = (
-                f"📋 *Case Status*\n\n"
-                f"*Case:* `{receipt}`\n"
-                f"*Status:* {result['status']}\n"
-                f"*Updated:* {result['updated_at']}"
-            )
-            if result.get("description"):
-                msg += f"\n\n{result['description'][:500]}"
-            if events_text:
-                msg += f"\n\n*Timeline:*{events_text}"
-            await _reply(update, msg)
+                msg = (
+                    f"📋 *Case Status*\n\n"
+                    f"*Case:* `{receipt}`\n"
+                    f"*Status:* {result['status']}\n"
+                    f"*Updated:* {result['updated_at']}"
+                )
+                if result.get("description"):
+                    msg += f"\n\n{result['description'][:500]}"
+                if events_text:
+                    msg += f"\n\n*Timeline:*{events_text}"
+                await _reply(update, msg)
+        except Exception:
+            logger.exception("Error while checking case %s (%s)", receipt, account)
+            await _reply(update, f"❌ Error checking `{receipt}`. Skipping to next case.")
 
 
 def _format_history_entry(r: dict) -> str:
@@ -547,6 +573,20 @@ async def cmd_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Bot runner (fully inside async context) ───────────────────────────────────
 
+async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    """Global handler so a transient failure is logged, not silently dropped.
+
+    Without this, python-telegram-bot logs 'No error handlers are registered'
+    and the offending command coroutine is torn down — which is exactly what
+    left /status stuck on its 'Checking status, please wait…' placeholder.
+    """
+    err = ctx.error
+    if isinstance(err, (TimedOut, NetworkError, RetryAfter)):
+        logger.warning("Transient Telegram error (handled): %s", err)
+    else:
+        logger.error("Unhandled exception in handler", exc_info=err)
+
+
 async def _bot_main(token: str):
     """
     Builds and runs the bot entirely inside an async context so that
@@ -555,7 +595,15 @@ async def _bot_main(token: str):
     """
     global _app
 
-    _app = Application.builder().token(token).build()
+    _app = (
+        Application.builder()
+        .token(token)
+        .connect_timeout(15.0)
+        .read_timeout(20.0)
+        .write_timeout(20.0)
+        .pool_timeout(15.0)
+        .build()
+    )
 
     _app.add_handler(CommandHandler("start", cmd_start))
     _app.add_handler(CommandHandler("help", cmd_help))
@@ -569,6 +617,7 @@ async def _bot_main(token: str):
     _app.add_handler(CommandHandler("history", cmd_history))
     _app.add_handler(CommandHandler("report", cmd_report))
     _app.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
+    _app.add_error_handler(_on_error)
 
     async with _app:
         await _app.start()
