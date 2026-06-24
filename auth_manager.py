@@ -367,6 +367,15 @@ def _kill_chrome(proc: "subprocess.Popen | None", profile_dir: str | None = None
                     cl = os.path.normcase(" ".join(p.info.get("cmdline") or []))
                     if needle in cl:
                         targets.append(p)
+                        # The matched proc is the MAIN browser; only it carries
+                        # --user-data-dir. Its renderer/GPU/utility children do
+                        # not, so they won't be matched by cmdline and survive as
+                        # orphans (the pile-up that later locks the profile and
+                        # forces "did not start"). Reap them explicitly.
+                        try:
+                            targets += p.children(recursive=True)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
         for p in targets:
@@ -807,8 +816,12 @@ def _do_silent_refresh(account: str, notify_fn=None) -> bool:
     profile_path = _chrome_profile_dir(account)
     profile_dir = str(profile_path)
 
-    # Clear stale lock files from any previously crashed Chrome so the launch
-    # isn't rejected for an "in use" profile.
+    # Reap any orphaned Chrome from a prior refresh that may still hold this
+    # profile's lock, THEN clear stale lock files. Without the reap, a surviving
+    # headless child keeps the profile "in use", the launch is rejected
+    # ("Headless Chrome did not start"), and we fall back to a heavier relaunch —
+    # the sequence that spikes Chrome processes.
+    _kill_chrome(None, profile_dir)
     _clear_chrome_locks(profile_path)
 
     try:
